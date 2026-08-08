@@ -15,10 +15,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
@@ -35,9 +35,8 @@ fun ScannerScreen() {
     if (cameraPermission.status.isGranted) {
         CameraPreview()
     } else {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Camera permission required")
-            // In real app: request permission properly
+        Box(Modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("Camera permission required. Please grant it.")
             LaunchedEffect(Unit) {
                 cameraPermission.launchPermissionRequest()
             }
@@ -66,7 +65,7 @@ fun CameraPreview() {
                         it.surfaceProvider = previewView.surfaceProvider
                     }
 
-                    // TODO: Force ultrawide camera (lowest focal length)
+                    // TODO: Later force ultrawide camera for better macro focus
                     val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
                     val analysis = ImageAnalysis.Builder()
