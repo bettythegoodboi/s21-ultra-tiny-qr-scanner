@@ -4,7 +4,10 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.graphics.ImageFormat
 import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.util.Log
@@ -16,6 +19,7 @@ import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -40,6 +44,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -51,36 +57,57 @@ data class CamOption(
     val minFocusDistance: Float
 )
 
-/**
- * Simple but effective image processing for low-contrast / small QR codes.
- * - Grayscale
- * - Contrast boost
- * - Mild sharpen
- */
+/** Convert ImageProxy (YUV_420_888) to Bitmap safely */
+fun ImageProxy.toBitmapSafe(): Bitmap? {
+    return try {
+        val yBuffer = planes[0].buffer
+        val uBuffer = planes[1].buffer
+        val vBuffer = planes[2].buffer
+
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+
+        val nv21 = ByteArray(ySize + uSize + vSize)
+
+        yBuffer.get(nv21, 0, ySize)
+        vBuffer.get(nv21, ySize, vSize)
+        uBuffer.get(nv21, ySize + vSize, uSize)
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), 90, out)
+        val imageBytes = out.toByteArray()
+        android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    } catch (e: Exception) {
+        Log.e("TinyQR", "toBitmap failed", e)
+        null
+    }
+}
+
+/** Image processing for low-contrast / small QR */
 fun processForQr(src: Bitmap): Bitmap {
-    val width = src.width
-    val height = src.height
-    val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val result = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(result)
     val paint = Paint()
 
-    // 1. Grayscale + strong contrast
-    val contrast = 1.6f
+    // Strong contrast + grayscale
+    val contrast = 1.7f
     val translate = (-0.5f * contrast + 0.5f) * 255f
-    val cm = ColorMatrix(floatArrayOf(
-        contrast, 0f, 0f, 0f, translate,
-        0f, contrast, 0f, 0f, translate,
-        0f, 0f, contrast, 0f, translate,
-        0f, 0f, 0f, 1f, 0f
-    ))
-    // Convert to grayscale
+    val cm = ColorMatrix(
+        floatArrayOf(
+            contrast, 0f, 0f, 0f, translate,
+            0f, contrast, 0f, 0f, translate,
+            0f, 0f, contrast, 0f, translate,
+            0f, 0f, 0f, 1f, 0f
+        )
+    )
     val gray = ColorMatrix()
     gray.setSaturation(0f)
     cm.postConcat(gray)
 
     paint.colorFilter = ColorMatrixColorFilter(cm)
     canvas.drawBitmap(src, 0f, 0f, paint)
-
     return result
 }
 
@@ -101,17 +128,13 @@ fun ScannerScreen() {
     var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
     var providerRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
 
-    // Manual focus
     var manualFocusEnabled by remember { mutableStateOf(false) }
     var focusDistance by remember { mutableStateOf(0f) }
     var maxFocusDistance by remember { mutableStateOf(10f) }
-
-    // Image processing
     var enhanceEnabled by remember { mutableStateOf(true) }
 
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
-    // Zoom
     LaunchedEffect(zoomRatio, camera) {
         try {
             camera?.let {
@@ -124,7 +147,6 @@ fun ScannerScreen() {
         } catch (_: Exception) {}
     }
 
-    // Torch
     LaunchedEffect(torchOn, camera) {
         try {
             if (camera?.cameraInfo?.hasFlashUnit() == true) {
@@ -170,7 +192,6 @@ fun ScannerScreen() {
 
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
             val scanner = BarcodeScanning.getClient()
@@ -182,9 +203,35 @@ fun ScannerScreen() {
                 }
 
                 try {
-                    val bitmap = imageProxy.toBitmap()
-                    val processed = if (enhanceEnabled) processForQr(bitmap) else bitmap
+                    val bitmap = imageProxy.toBitmapSafe()
+                    if (bitmap == null) {
+                        // Fallback to original media image
+                        val mediaImage = imageProxy.image
+                        if (mediaImage != null) {
+                            val image = InputImage.fromMediaImage(
+                                mediaImage,
+                                imageProxy.imageInfo.rotationDegrees
+                            )
+                            scanner.process(image)
+                                .addOnSuccessListener { barcodes ->
+                                    for (barcode in barcodes) {
+                                        if (barcode.format == Barcode.FORMAT_QR_CODE) {
+                                            barcode.rawValue?.let { value ->
+                                                lastResult = value
+                                                isScanning = false
+                                                statusText = "QR Found!"
+                                            }
+                                        }
+                                    }
+                                }
+                                .addOnCompleteListener { imageProxy.close() }
+                        } else {
+                            imageProxy.close()
+                        }
+                        return@setAnalyzer
+                    }
 
+                    val processed = if (enhanceEnabled) processForQr(bitmap) else bitmap
                     val image = InputImage.fromBitmap(processed, imageProxy.imageInfo.rotationDegrees)
 
                     scanner.process(image)
@@ -201,7 +248,8 @@ fun ScannerScreen() {
                         }
                         .addOnCompleteListener {
                             imageProxy.close()
-                            if (processed != bitmap) processed.recycle()
+                            if (processed !== bitmap) processed.recycle()
+                            bitmap.recycle()
                         }
                 } catch (e: Exception) {
                     Log.e("TinyQR", "Analysis error", e)
@@ -358,7 +406,6 @@ fun ScannerScreen() {
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            // Camera selection
             Text("Camera (${availableCams.size}):", color = Color.White, fontSize = 12.sp)
             Row(
                 modifier = Modifier
@@ -381,7 +428,6 @@ fun ScannerScreen() {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Enhance + Manual Focus switches
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly,
@@ -407,7 +453,6 @@ fun ScannerScreen() {
                 )
             }
 
-            // Zoom + Torch
             Text("Zoom: ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
             Row(
                 modifier = Modifier.fillMaxWidth(),
