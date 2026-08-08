@@ -1,8 +1,11 @@
 package com.s21.tinyqr.ui
 
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.util.Log
+import android.util.Range
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
@@ -40,7 +43,8 @@ data class CamOption(
     val label: String,
     val cameraInfo: CameraInfo,
     val focalLength: Float,
-    val hasFlash: Boolean
+    val hasFlash: Boolean,
+    val minFocusDistance: Float // diopters, 0 = infinity
 )
 
 @OptIn(ExperimentalCamera2Interop::class)
@@ -60,9 +64,14 @@ fun ScannerScreen() {
     var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
     var providerRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
 
+    // Manual focus
+    var manualFocusEnabled by remember { mutableStateOf(false) }
+    var focusDistance by remember { mutableStateOf(0f) } // 0 = infinity, higher = closer
+    var maxFocusDistance by remember { mutableStateOf(10f) }
+
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
-    // Apply zoom safely
+    // Zoom
     LaunchedEffect(zoomRatio, camera) {
         try {
             camera?.let {
@@ -75,7 +84,7 @@ fun ScannerScreen() {
         } catch (_: Exception) {}
     }
 
-    // Apply torch safely
+    // Torch
     LaunchedEffect(torchOn, camera) {
         try {
             if (camera?.cameraInfo?.hasFlashUnit() == true) {
@@ -96,7 +105,24 @@ fun ScannerScreen() {
         try {
             provider.unbindAll()
 
-            val preview = Preview.Builder().build().also {
+            val previewBuilder = Preview.Builder()
+
+            // Apply Camera2Interop for manual focus if enabled
+            if (manualFocusEnabled && option.minFocusDistance > 0f) {
+                val extender = Camera2Interop.Extender(previewBuilder)
+                extender.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                )
+                // focusDistance is in diopters (1/meters). Higher = closer.
+                val diopters = focusDistance.coerceIn(0f, option.minFocusDistance)
+                extender.setCaptureRequestOption(
+                    CaptureRequest.LENS_FOCUS_DISTANCE,
+                    diopters
+                )
+            }
+
+            val preview = previewBuilder.build().also {
                 it.surfaceProvider = previewView.surfaceProvider
             }
 
@@ -150,17 +176,21 @@ fun ScannerScreen() {
             )
             camera = cam
 
-            // Force focus on center
-            try {
-                val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
-                val point = factory.createPoint(0.5f, 0.5f)
-                val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
-                    .setAutoCancelDuration(2, TimeUnit.SECONDS)
-                    .build()
-                cam.cameraControl.startFocusAndMetering(action)
-            } catch (_: Exception) {}
+            maxFocusDistance = if (option.minFocusDistance > 0f) option.minFocusDistance else 10f
 
-            statusText = "${option.label} | Zoom ${String.format("%.1f", zoomRatio)}x"
+            // If not in manual mode, do continuous AF on center
+            if (!manualFocusEnabled) {
+                try {
+                    val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
+                    val point = factory.createPoint(0.5f, 0.5f)
+                    val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+                        .setAutoCancelDuration(2, TimeUnit.SECONDS)
+                        .build()
+                    cam.cameraControl.startFocusAndMetering(action)
+                } catch (_: Exception) {}
+            }
+
+            statusText = "${option.label} | ${if (manualFocusEnabled) "Manual Focus" else "Auto Focus"}"
             torchOn = false
 
         } catch (e: Exception) {
@@ -169,8 +199,8 @@ fun ScannerScreen() {
         }
     }
 
-    // Rebind when camera selection changes
-    LaunchedEffect(selectedCamIndex, availableCams) {
+    // Rebind when camera or manual focus settings change
+    LaunchedEffect(selectedCamIndex, availableCams, manualFocusEnabled, focusDistance) {
         if (availableCams.isNotEmpty()) {
             bindSelectedCamera()
         }
@@ -189,7 +219,6 @@ fun ScannerScreen() {
                         val provider = cameraProviderFuture.get()
                         providerRef = provider
 
-                        // Collect all back cameras with useful info
                         val cams = mutableListOf<CamOption>()
                         for (info in provider.availableCameraInfos) {
                             if (info.lensFacing != CameraSelector.LENS_FACING_BACK) continue
@@ -201,6 +230,10 @@ fun ScannerScreen() {
                                 val focal = focals?.firstOrNull() ?: 0f
                                 val hasFlash = info.hasFlashUnit()
 
+                                val minFocus = c2.getCameraCharacteristic(
+                                    CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE
+                                ) ?: 0f
+
                                 val label = when {
                                     focal < 2.5f -> "Ultrawide"
                                     focal < 7f -> "Main"
@@ -208,16 +241,14 @@ fun ScannerScreen() {
                                     else -> "10x Tele"
                                 }
 
-                                cams.add(CamOption(label, info, focal, hasFlash))
+                                cams.add(CamOption(label, info, focal, hasFlash, minFocus))
                             } catch (e: Exception) {
                                 Log.e("TinyQR", "Cam info error", e)
                             }
                         }
 
-                        // Sort: Ultrawide first, then Main, then teles
                         availableCams = cams.sortedBy { it.focalLength }
 
-                        // Prefer Ultrawide if available
                         val uwIndex = availableCams.indexOfFirst { it.label == "Ultrawide" }
                         selectedCamIndex = if (uwIndex >= 0) uwIndex else 0
 
@@ -251,7 +282,7 @@ fun ScannerScreen() {
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "Hold phone 2~5cm from tiny QR",
+                text = "Hold 2~5cm from tiny QR | Cams found: ${availableCams.size}",
                 color = Color.LightGray,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
@@ -264,12 +295,11 @@ fun ScannerScreen() {
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color.Black.copy(alpha = 0.8f))
+                .background(Color.Black.copy(alpha = 0.82f))
                 .padding(10.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
 
-            // Result
             if (lastResult != null) {
                 Text("Result:", color = Color.White, fontSize = 12.sp)
                 Text(
@@ -292,8 +322,8 @@ fun ScannerScreen() {
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            // Camera selection buttons
-            Text("Select Camera:", color = Color.White, fontSize = 12.sp)
+            // Camera buttons
+            Text("Select Camera (${availableCams.size} available):", color = Color.White, fontSize = 12.sp)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -306,7 +336,7 @@ fun ScannerScreen() {
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (selectedCamIndex == index) Color(0xFF2196F3) else Color.DarkGray
                         ),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                     ) {
                         Text("${cam.label}\n${String.format("%.1f", cam.focalLength)}mm", fontSize = 11.sp)
                     }
@@ -315,7 +345,34 @@ fun ScannerScreen() {
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Zoom + Torch + Focus
+            // Manual Focus section
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Manual Focus", color = Color.White, fontSize = 13.sp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Switch(
+                    checked = manualFocusEnabled,
+                    onCheckedChange = { manualFocusEnabled = it }
+                )
+            }
+
+            if (manualFocusEnabled) {
+                Text(
+                    text = "Focus Distance (closer ← → infinity)",
+                    color = Color.LightGray,
+                    fontSize = 11.sp
+                )
+                Slider(
+                    value = focusDistance,
+                    onValueChange = { focusDistance = it },
+                    valueRange = 0f..maxFocusDistance,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            // Zoom + Torch
             Text("Zoom: ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
 
             Row(
@@ -347,14 +404,12 @@ fun ScannerScreen() {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Manual focus / scan control
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 Button(
                     onClick = {
-                        // Force re-focus
                         try {
                             camera?.let { cam ->
                                 val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
@@ -368,7 +423,7 @@ fun ScannerScreen() {
                         } catch (_: Exception) {}
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF607D8B))
-                ) { Text("Focus") }
+                ) { Text("Auto Focus") }
 
                 Button(
                     onClick = {
@@ -381,7 +436,7 @@ fun ScannerScreen() {
             }
 
             Text(
-                text = "Tip: Ultrawide + Zoom 2~4x works best for tiny QR",
+                text = "Tip: Ultrawide + Manual Focus + Zoom 2~4x for tiny QR",
                 color = Color.Gray,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 4.dp)
