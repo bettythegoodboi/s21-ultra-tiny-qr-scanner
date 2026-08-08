@@ -1,9 +1,13 @@
 package com.s21.tinyqr.ui
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.util.Log
-import android.util.Range
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -44,8 +48,41 @@ data class CamOption(
     val cameraInfo: CameraInfo,
     val focalLength: Float,
     val hasFlash: Boolean,
-    val minFocusDistance: Float // diopters, 0 = infinity
+    val minFocusDistance: Float
 )
+
+/**
+ * Simple but effective image processing for low-contrast / small QR codes.
+ * - Grayscale
+ * - Contrast boost
+ * - Mild sharpen
+ */
+fun processForQr(src: Bitmap): Bitmap {
+    val width = src.width
+    val height = src.height
+    val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(result)
+    val paint = Paint()
+
+    // 1. Grayscale + strong contrast
+    val contrast = 1.6f
+    val translate = (-0.5f * contrast + 0.5f) * 255f
+    val cm = ColorMatrix(floatArrayOf(
+        contrast, 0f, 0f, 0f, translate,
+        0f, contrast, 0f, 0f, translate,
+        0f, 0f, contrast, 0f, translate,
+        0f, 0f, 0f, 1f, 0f
+    ))
+    // Convert to grayscale
+    val gray = ColorMatrix()
+    gray.setSaturation(0f)
+    cm.postConcat(gray)
+
+    paint.colorFilter = ColorMatrixColorFilter(cm)
+    canvas.drawBitmap(src, 0f, 0f, paint)
+
+    return result
+}
 
 @OptIn(ExperimentalCamera2Interop::class)
 @Composable
@@ -55,7 +92,7 @@ fun ScannerScreen() {
 
     var lastResult by remember { mutableStateOf<String?>(null) }
     var isScanning by remember { mutableStateOf(true) }
-    var zoomRatio by remember { mutableStateOf(2.0f) }
+    var zoomRatio by remember { mutableStateOf(2.5f) }
     var torchOn by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("Loading cameras...") }
     var availableCams by remember { mutableStateOf<List<CamOption>>(emptyList()) }
@@ -66,8 +103,11 @@ fun ScannerScreen() {
 
     // Manual focus
     var manualFocusEnabled by remember { mutableStateOf(false) }
-    var focusDistance by remember { mutableStateOf(0f) } // 0 = infinity, higher = closer
+    var focusDistance by remember { mutableStateOf(0f) }
     var maxFocusDistance by remember { mutableStateOf(10f) }
+
+    // Image processing
+    var enhanceEnabled by remember { mutableStateOf(true) }
 
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
@@ -107,14 +147,12 @@ fun ScannerScreen() {
 
             val previewBuilder = Preview.Builder()
 
-            // Apply Camera2Interop for manual focus if enabled
             if (manualFocusEnabled && option.minFocusDistance > 0f) {
                 val extender = Camera2Interop.Extender(previewBuilder)
                 extender.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AF_MODE,
                     CaptureRequest.CONTROL_AF_MODE_OFF
                 )
-                // focusDistance is in diopters (1/meters). Higher = closer.
                 val diopters = focusDistance.coerceIn(0f, option.minFocusDistance)
                 extender.setCaptureRequestOption(
                     CaptureRequest.LENS_FOCUS_DISTANCE,
@@ -127,13 +165,12 @@ fun ScannerScreen() {
             }
 
             val selector = CameraSelector.Builder()
-                .addCameraFilter { list ->
-                    list.filter { it == option.cameraInfo }
-                }
+                .addCameraFilter { list -> list.filter { it == option.cameraInfo } }
                 .build()
 
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
             val scanner = BarcodeScanning.getClient()
@@ -144,12 +181,12 @@ fun ScannerScreen() {
                     return@setAnalyzer
                 }
 
-                val mediaImage = imageProxy.image
-                if (mediaImage != null) {
-                    val image = InputImage.fromMediaImage(
-                        mediaImage,
-                        imageProxy.imageInfo.rotationDegrees
-                    )
+                try {
+                    val bitmap = imageProxy.toBitmap()
+                    val processed = if (enhanceEnabled) processForQr(bitmap) else bitmap
+
+                    val image = InputImage.fromBitmap(processed, imageProxy.imageInfo.rotationDegrees)
+
                     scanner.process(image)
                         .addOnSuccessListener { barcodes ->
                             for (barcode in barcodes) {
@@ -162,8 +199,12 @@ fun ScannerScreen() {
                                 }
                             }
                         }
-                        .addOnCompleteListener { imageProxy.close() }
-                } else {
+                        .addOnCompleteListener {
+                            imageProxy.close()
+                            if (processed != bitmap) processed.recycle()
+                        }
+                } catch (e: Exception) {
+                    Log.e("TinyQR", "Analysis error", e)
                     imageProxy.close()
                 }
             }
@@ -178,7 +219,6 @@ fun ScannerScreen() {
 
             maxFocusDistance = if (option.minFocusDistance > 0f) option.minFocusDistance else 10f
 
-            // If not in manual mode, do continuous AF on center
             if (!manualFocusEnabled) {
                 try {
                     val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
@@ -190,7 +230,7 @@ fun ScannerScreen() {
                 } catch (_: Exception) {}
             }
 
-            statusText = "${option.label} | ${if (manualFocusEnabled) "Manual Focus" else "Auto Focus"}"
+            statusText = "${option.label} | Enhance: ${if (enhanceEnabled) "ON" else "OFF"}"
             torchOn = false
 
         } catch (e: Exception) {
@@ -199,8 +239,7 @@ fun ScannerScreen() {
         }
     }
 
-    // Rebind when camera or manual focus settings change
-    LaunchedEffect(selectedCamIndex, availableCams, manualFocusEnabled, focusDistance) {
+    LaunchedEffect(selectedCamIndex, availableCams, manualFocusEnabled, focusDistance, enhanceEnabled) {
         if (availableCams.isNotEmpty()) {
             bindSelectedCamera()
         }
@@ -229,7 +268,6 @@ fun ScannerScreen() {
                                 )
                                 val focal = focals?.firstOrNull() ?: 0f
                                 val hasFlash = info.hasFlashUnit()
-
                                 val minFocus = c2.getCameraCharacteristic(
                                     CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE
                                 ) ?: 0f
@@ -248,10 +286,8 @@ fun ScannerScreen() {
                         }
 
                         availableCams = cams.sortedBy { it.focalLength }
-
                         val uwIndex = availableCams.indexOfFirst { it.label == "Ultrawide" }
                         selectedCamIndex = if (uwIndex >= 0) uwIndex else 0
-
                         statusText = "Found ${availableCams.size} cameras"
 
                     } catch (e: Exception) {
@@ -282,7 +318,7 @@ fun ScannerScreen() {
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "Hold 2~5cm from tiny QR | Cams found: ${availableCams.size}",
+                text = "Hold 2~5cm | Cams: ${availableCams.size} | Enhance helps low-contrast QR",
                 color = Color.LightGray,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
@@ -295,7 +331,7 @@ fun ScannerScreen() {
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color.Black.copy(alpha = 0.82f))
+                .background(Color.Black.copy(alpha = 0.85f))
                 .padding(10.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -322,8 +358,8 @@ fun ScannerScreen() {
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            // Camera buttons
-            Text("Select Camera (${availableCams.size} available):", color = Color.White, fontSize = 12.sp)
+            // Camera selection
+            Text("Camera (${availableCams.size}):", color = Color.White, fontSize = 12.sp)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -343,27 +379,26 @@ fun ScannerScreen() {
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
-            // Manual Focus section
+            // Enhance + Manual Focus switches
             Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Manual Focus", color = Color.White, fontSize = 13.sp)
-                Spacer(modifier = Modifier.width(8.dp))
-                Switch(
-                    checked = manualFocusEnabled,
-                    onCheckedChange = { manualFocusEnabled = it }
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Enhance", color = Color.White, fontSize = 13.sp)
+                    Switch(checked = enhanceEnabled, onCheckedChange = { enhanceEnabled = it })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Manual Focus", color = Color.White, fontSize = 13.sp)
+                    Switch(checked = manualFocusEnabled, onCheckedChange = { manualFocusEnabled = it })
+                }
             }
 
             if (manualFocusEnabled) {
-                Text(
-                    text = "Focus Distance (closer ← → infinity)",
-                    color = Color.LightGray,
-                    fontSize = 11.sp
-                )
+                Text("Focus (closer ← → far)", color = Color.LightGray, fontSize = 11.sp)
                 Slider(
                     value = focusDistance,
                     onValueChange = { focusDistance = it },
@@ -374,7 +409,6 @@ fun ScannerScreen() {
 
             // Zoom + Torch
             Text("Zoom: ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
-
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
@@ -436,7 +470,7 @@ fun ScannerScreen() {
             }
 
             Text(
-                text = "Tip: Ultrawide + Manual Focus + Zoom 2~4x for tiny QR",
+                text = "Best: Ultrawide + Enhance ON + Manual Focus + Zoom 2.5~4x",
                 color = Color.Gray,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 4.dp)
