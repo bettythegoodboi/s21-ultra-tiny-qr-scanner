@@ -48,7 +48,6 @@ object QrDecoder {
             return dmReader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hintsDm()).text
         } catch (_: Exception) {
         }
-
         val multi = MultiFormatReader()
         multi.setHints(hintsAll())
         try {
@@ -64,12 +63,39 @@ object QrDecoder {
 
     fun decodeYuv(yData: ByteArray, width: Int, height: Int): String? {
         if (width < 16 || height < 16) return null
+
+        // Custom pipeline on Y as grayscale bitmap path
+        try {
+            val bmp = yToBitmap(yData, width, height)
+            CustomDataMatrix.decode(bmp)?.let {
+                bmp.recycle()
+                return it
+            }
+            // Center crops for custom
+            for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.35f)) {
+                val cw = (width * ratio).toInt().coerceAtLeast(32)
+                val ch = (height * ratio).toInt().coerceAtLeast(32)
+                val left = ((width - cw) / 2).coerceAtLeast(0)
+                val top = ((height - ch) / 2).coerceAtLeast(0)
+                val crop = Bitmap.createBitmap(bmp, left, top, minOf(cw, width - left), minOf(ch, height - top))
+                CustomDataMatrix.decode(crop)?.let {
+                    crop.recycle()
+                    bmp.recycle()
+                    return it
+                }
+                crop.recycle()
+            }
+            bmp.recycle()
+        } catch (e: Exception) {
+            Log.e("TinyQR", "custom yuv", e)
+        }
+
         try {
             val full = PlanarYUVLuminanceSource(yData, width, height, 0, 0, width, height, false)
             decodeSource(full)?.let { return it }
         } catch (_: Exception) {
         }
-        for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f, 0.7f)) {
+        for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f)) {
             val cw = (width * ratio).toInt().coerceAtLeast(32)
             val ch = (height * ratio).toInt().coerceAtLeast(32)
             val left = ((width - cw) / 2).coerceAtLeast(0)
@@ -86,46 +112,40 @@ object QrDecoder {
         return null
     }
 
-    private fun tryBitmap(bitmap: Bitmap): String? {
-        val w = bitmap.width
-        val h = bitmap.height
-        if (w < 16 || h < 16) return null
-        val pixels = IntArray(w * h)
-        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-        return try {
-            decodeSource(RGBLuminanceSource(w, h, pixels))
-        } catch (_: Exception) {
-            null
+    private fun yToBitmap(yData: ByteArray, width: Int, height: Int): Bitmap {
+        val pixels = IntArray(width * height)
+        val n = minOf(yData.size, pixels.size)
+        for (i in 0 until n) {
+            val y = yData[i].toInt() and 0xff
+            pixels[i] = (0xff shl 24) or (y shl 16) or (y shl 8) or y
         }
+        return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
     }
 
-    /**
-     * Still image / gallery path — try full, crops, and upscales.
-     */
     fun decode(bitmap: Bitmap): Pair<String, String>? {
-        Log.d("TinyQR", "Gallery decode ${bitmap.width}x${bitmap.height}")
+        Log.d("TinyQR", "decode ${bitmap.width}x${bitmap.height}")
 
-        // 1) Full image
-        tryBitmap(bitmap)?.let { return it to "full" }
+        // 1) Custom fundamental pipeline FIRST
+        CustomDataMatrix.decode(bitmap)?.let { return it to "custom" }
 
-        // 2) Upscale full if small
-        if (bitmap.width < 800 || bitmap.height < 800) {
-            val f = 800f / minOf(bitmap.width, bitmap.height)
+        // 2) Upscaled custom
+        if (bitmap.width < 600 || bitmap.height < 600) {
+            val f = 600f / minOf(bitmap.width, bitmap.height)
             val up = Bitmap.createScaledBitmap(
                 bitmap,
                 (bitmap.width * f).toInt(),
                 (bitmap.height * f).toInt(),
                 true
             )
-            tryBitmap(up)?.let {
+            CustomDataMatrix.decode(up)?.let {
                 if (up !== bitmap) up.recycle()
-                return it to "up-full"
+                return it to "custom-up"
             }
             if (up !== bitmap) up.recycle()
         }
 
-        // 3) Center crops + optional upscale
-        for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f, 0.7f, 0.25f)) {
+        // 3) Center crop + custom
+        for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f)) {
             val w = bitmap.width
             val h = bitmap.height
             val cw = (w * ratio).toInt().coerceAtLeast(32)
@@ -134,40 +154,34 @@ object QrDecoder {
             val top = ((h - ch) / 2).coerceAtLeast(0)
             val rw = minOf(cw, w - left)
             val rh = minOf(ch, h - top)
-            if (rw < 24 || rh < 24) continue
-
-            val crop = try {
-                Bitmap.createBitmap(bitmap, left, top, rw, rh)
-            } catch (_: Exception) {
-                continue
-            }
-
-            tryBitmap(crop)?.let {
-                if (crop !== bitmap) crop.recycle()
-                return it to "crop"
-            }
-
-            // Upscale small crops so modules have enough pixels
-            for (scale in floatArrayOf(2f, 3f, 4f, 5f)) {
-                val tw = (rw * scale).toInt()
-                val th = (rh * scale).toInt()
-                if (tw > 2000 || th > 2000) continue
-                val up = try {
-                    Bitmap.createScaledBitmap(crop, tw, th, true)
-                } catch (_: Exception) {
-                    continue
+            try {
+                val crop = Bitmap.createBitmap(bitmap, left, top, rw, rh)
+                CustomDataMatrix.decode(crop)?.let {
+                    if (crop !== bitmap) crop.recycle()
+                    return it to "custom-crop"
                 }
-                tryBitmap(up)?.let {
+                val up = Bitmap.createScaledBitmap(crop, rw * 3, rh * 3, true)
+                CustomDataMatrix.decode(up)?.let {
                     up.recycle()
                     if (crop !== bitmap) crop.recycle()
-                    return it to "crop-up"
+                    return it to "custom-crop-up"
                 }
                 up.recycle()
+                if (crop !== bitmap) crop.recycle()
+            } catch (_: Exception) {
             }
-            if (crop !== bitmap) crop.recycle()
         }
 
-        Log.d("TinyQR", "Gallery decode failed")
+        // 4) Stock ZXing last
+        try {
+            val pixels = IntArray(bitmap.width * bitmap.height)
+            bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            decodeSource(RGBLuminanceSource(bitmap.width, bitmap.height, pixels))?.let {
+                return it to "zxing"
+            }
+        } catch (_: Exception) {
+        }
+
         return null
     }
 }
