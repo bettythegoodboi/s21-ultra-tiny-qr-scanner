@@ -17,28 +17,34 @@ import java.util.EnumMap
 import java.util.EnumSet
 
 /**
- * Decoder tuned for tiny industrial QR codes (a few mm on curved/dark parts).
- * Main fix: center-crop + strong upscale so each module has enough pixels.
+ * Industrial 2D decoder.
+ * This part code is Data Matrix (confirmed by Cognex: 00086192327).
+ * Prioritize Data Matrix, then QR / Aztec / PDF417.
  */
 object QrDecoder {
 
-    private val supportedFormats = EnumSet.of(
-        BarcodeFormat.QR_CODE,
+    // Data Matrix FIRST - industrial part marks are usually Data Matrix
+    private val formatsDataMatrixFirst = EnumSet.of(
         BarcodeFormat.DATA_MATRIX,
+        BarcodeFormat.QR_CODE,
         BarcodeFormat.AZTEC,
         BarcodeFormat.PDF_417
     )
 
-    private fun hints(): Map<DecodeHintType, Any> {
+    private val formatsDataMatrixOnly = EnumSet.of(
+        BarcodeFormat.DATA_MATRIX
+    )
+
+    private fun hints(formats: EnumSet<BarcodeFormat>): Map<DecodeHintType, Any> {
         val map = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java)
-        map[DecodeHintType.POSSIBLE_FORMATS] = supportedFormats
+        map[DecodeHintType.POSSIBLE_FORMATS] = formats
         map[DecodeHintType.TRY_HARDER] = true
         map[DecodeHintType.CHARACTER_SET] = "UTF-8"
         return map
     }
 
-    private fun decodeOnce(bitmap: Bitmap): String? {
-        if (bitmap.width < 20 || bitmap.height < 20) return null
+    private fun decodeOnce(bitmap: Bitmap, formats: EnumSet<BarcodeFormat>): String? {
+        if (bitmap.width < 16 || bitmap.height < 16) return null
         return try {
             val w = bitmap.width
             val h = bitmap.height
@@ -46,18 +52,22 @@ object QrDecoder {
             bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
             val source = RGBLuminanceSource(w, h, pixels)
 
-            // Hybrid first
+            // Hybrid
             try {
                 val reader = MultiFormatReader()
-                reader.setHints(hints())
-                return reader.decodeWithState(BinaryBitmap(HybridBinarizer(source))).text
+                reader.setHints(hints(formats))
+                val result = reader.decodeWithState(BinaryBitmap(HybridBinarizer(source)))
+                Log.d("TinyQR", "Decoded ${result.barcodeFormat}: ${result.text}")
+                return result.text
             } catch (_: Exception) {}
 
-            // Global histogram fallback
+            // Global histogram
             try {
                 val reader = MultiFormatReader()
-                reader.setHints(hints())
-                return reader.decodeWithState(BinaryBitmap(GlobalHistogramBinarizer(source))).text
+                reader.setHints(hints(formats))
+                val result = reader.decodeWithState(BinaryBitmap(GlobalHistogramBinarizer(source)))
+                Log.d("TinyQR", "Decoded ${result.barcodeFormat}: ${result.text}")
+                return result.text
             } catch (_: Exception) {}
 
             null
@@ -105,71 +115,75 @@ object QrDecoder {
         return out
     }
 
-    /** Center crop – tiny QR is usually in the middle when zoomed */
     private fun centerCrop(src: Bitmap, ratio: Float): Bitmap {
         val w = src.width
         val h = src.height
-        val cw = (w * ratio).toInt().coerceAtLeast(40)
-        val ch = (h * ratio).toInt().coerceAtLeast(40)
+        val cw = (w * ratio).toInt().coerceAtLeast(32)
+        val ch = (h * ratio).toInt().coerceAtLeast(32)
         val left = ((w - cw) / 2).coerceAtLeast(0)
         val top = ((h - ch) / 2).coerceAtLeast(0)
         return Bitmap.createBitmap(src, left, top, cw.coerceAtMost(w - left), ch.coerceAtMost(h - top))
     }
 
-    /** Upscale so each QR module has enough pixels to decode */
     private fun upscale(src: Bitmap, factor: Float): Bitmap {
         val w = (src.width * factor).toInt().coerceAtLeast(1)
         val h = (src.height * factor).toInt().coerceAtLeast(1)
-        // Cap to avoid OOM on large frames
-        val maxSide = 1200
-        val scale = if (w > maxSide || h > maxSide) {
-            maxSide.toFloat() / maxOf(w, h)
-        } else 1f
-        val fw = (w * scale).toInt().coerceAtLeast(1)
-        val fh = (h * scale).toInt().coerceAtLeast(1)
-        return Bitmap.createScaledBitmap(src, fw, fh, true)
+        val maxSide = 1400
+        val scale = if (w > maxSide || h > maxSide) maxSide.toFloat() / maxOf(w, h) else 1f
+        return Bitmap.createScaledBitmap(
+            src,
+            (w * scale).toInt().coerceAtLeast(1),
+            (h * scale).toInt().coerceAtLeast(1),
+            true
+        )
+    }
+
+    private fun tryAllFormats(bmp: Bitmap): String? {
+        // 1) Data Matrix only first (industrial codes)
+        decodeOnce(bmp, formatsDataMatrixOnly)?.let { return it }
+        // 2) All formats
+        decodeOnce(bmp, formatsDataMatrixFirst)?.let { return it }
+        return null
     }
 
     private fun tryVariant(bmp: Bitmap): String? {
-        decodeOnce(bmp)?.let { return it }
-        val c1 = contrastGray(bmp, 1.6f)
-        decodeOnce(c1)?.let { c1.recycle(); return it }
+        tryAllFormats(bmp)?.let { return it }
+
+        val c1 = contrastGray(bmp, 1.5f)
+        tryAllFormats(c1)?.let { c1.recycle(); return it }
+
         val c2 = contrastGray(bmp, 2.2f)
-        decodeOnce(c2)?.let { c1.recycle(); c2.recycle(); return it }
+        tryAllFormats(c2)?.let { c1.recycle(); c2.recycle(); return it }
+
         val inv = invert(c1)
-        decodeOnce(inv)?.let {
+        tryAllFormats(inv)?.let {
             c1.recycle(); c2.recycle(); inv.recycle(); return it
         }
+
         c1.recycle(); c2.recycle(); inv.recycle()
         return null
     }
 
-    /**
-     * Main entry for tiny industrial QR.
-     * Strategy: full frame → center crops → strong upscale → contrast/invert
-     */
     fun decode(bitmap: Bitmap): Pair<String, String>? {
-        // 1. Full frame as-is
-        tryVariant(bitmap)?.let { return it to "full" }
+        // Full frame
+        tryVariant(bitmap)?.let { return it to "DataMatrix/QR" }
 
-        // 2. Center crops at different sizes (QR is usually centered when user aims)
-        val cropRatios = listOf(0.45f, 0.55f, 0.35f, 0.65f)
-        val scales = listOf(3f, 4f, 5f, 2.5f)
+        // Center crops + upscale (critical for tiny industrial marks)
+        val ratios = listOf(0.4f, 0.5f, 0.35f, 0.6f, 0.3f)
+        val scales = listOf(3f, 4f, 5f, 6f, 2.5f)
 
-        for (ratio in cropRatios) {
+        for (ratio in ratios) {
             val crop = try {
                 centerCrop(bitmap, ratio)
             } catch (_: Exception) {
                 continue
             }
 
-            // Try crop directly
             tryVariant(crop)?.let {
                 if (crop !== bitmap) crop.recycle()
                 return it to "crop"
             }
 
-            // Upscale the crop (critical for tiny codes)
             for (s in scales) {
                 val up = try {
                     upscale(crop, s)
@@ -183,13 +197,11 @@ object QrDecoder {
                 }
                 up.recycle()
             }
-
             if (crop !== bitmap) crop.recycle()
         }
 
-        // 3. Upscale full frame as last resort
         try {
-            val upFull = upscale(bitmap, 2.5f)
+            val upFull = upscale(bitmap, 3f)
             tryVariant(upFull)?.let {
                 upFull.recycle()
                 return it to "full-up"
@@ -197,7 +209,7 @@ object QrDecoder {
             upFull.recycle()
         } catch (_: Exception) {}
 
-        Log.d("TinyQR", "All decode attempts failed")
+        Log.d("TinyQR", "Decode failed")
         return null
     }
 }
