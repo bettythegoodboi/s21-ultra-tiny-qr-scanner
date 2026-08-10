@@ -13,7 +13,6 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
-import android.util.Size
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -127,7 +126,6 @@ fun ScannerScreen() {
             }
             statusText = "Decoding Data Matrix..."
 
-            // ZXing Data Matrix hardened path
             val zx = QrDecoder.decode(bitmap)
             if (zx != null) {
                 lastResult = zx.first
@@ -136,7 +134,6 @@ fun ScannerScreen() {
                 return@rememberLauncherForActivityResult
             }
 
-            // ML Kit Data Matrix
             val options = BarcodeScannerOptions.Builder()
                 .setBarcodeFormats(
                     Barcode.FORMAT_DATA_MATRIX,
@@ -192,15 +189,19 @@ fun ScannerScreen() {
                 val zs = it.cameraInfo.zoomState.value ?: return@let
                 it.cameraControl.setZoomRatio(zoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
     }
 
     LaunchedEffect(torchOn, camera) {
         try {
             if (camera?.cameraInfo?.hasFlashUnit() == true) {
                 camera?.cameraControl?.enableTorch(torchOn)
-            } else torchOn = false
-        } catch (_: Exception) {}
+            } else {
+                torchOn = false
+            }
+        } catch (_: Exception) {
+        }
     }
 
     fun bindCamera() {
@@ -215,22 +216,25 @@ fun ScannerScreen() {
             val previewBuilder = Preview.Builder()
             if (manualFocusEnabled && option.minFocusDistance > 0f) {
                 val ext = Camera2Interop.Extender(previewBuilder)
-                ext.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                ext.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                )
                 ext.setCaptureRequestOption(
                     CaptureRequest.LENS_FOCUS_DISTANCE,
                     focusDistance.coerceIn(0f, option.minFocusDistance)
                 )
             }
-            val preview = previewBuilder.build().also { it.surfaceProvider = previewView.surfaceProvider }
+            val preview = previewBuilder.build().also {
+                it.surfaceProvider = previewView.surfaceProvider
+            }
 
             val selector = CameraSelector.Builder()
                 .addCameraFilter { list -> list.filter { it == option.cameraInfo } }
                 .build()
 
-            // Higher resolution analysis for tiny Data Matrix
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setTargetResolution(Size(1920, 1080))
                 .build()
 
             val mlOptions = BarcodeScannerOptions.Builder()
@@ -256,7 +260,6 @@ fun ScannerScreen() {
                     }
                     lastFrameBitmap = bmp.copy(bmp.config ?: Bitmap.Config.ARGB_8888, false)
 
-                    // Primary: hardened Data Matrix decoder
                     val result = QrDecoder.decode(bmp)
                     if (result != null) {
                         lastResult = result.first
@@ -266,7 +269,6 @@ fun ScannerScreen() {
                         return@setAnalyzer
                     }
 
-                    // Fallback ML Kit
                     ml.process(InputImage.fromBitmap(bmp, proxy.imageInfo.rotationDegrees))
                         .addOnSuccessListener { codes ->
                             if (codes.isNotEmpty()) {
@@ -290,10 +292,12 @@ fun ScannerScreen() {
                 try {
                     val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
                     val action = FocusMeteringAction.Builder(
-                        factory.createPoint(0.5f, 0.5f), FocusMeteringAction.FLAG_AF
+                        factory.createPoint(0.5f, 0.5f),
+                        FocusMeteringAction.FLAG_AF
                     ).setAutoCancelDuration(2, TimeUnit.SECONDS).build()
                     cam.cameraControl.startFocusAndMetering(action)
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                }
             }
 
             statusText = "${option.label} | Data Matrix mode"
@@ -308,7 +312,7 @@ fun ScannerScreen() {
         if (availableCams.isNotEmpty()) bindCamera()
     }
 
-    Box(Modifier = Modifier.fillMaxSize()) {
+    Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
             factory = { ctx ->
                 val pv = PreviewView(ctx)
@@ -336,7 +340,8 @@ fun ScannerScreen() {
                                     else -> "10x Tele"
                                 }
                                 cams.add(CamOption(label, info, focal, info.hasFlashUnit(), minF))
-                            } catch (_: Exception) {}
+                            } catch (_: Exception) {
+                            }
                         }
                         availableCams = cams.sortedBy { it.focalLength }
                         val uw = availableCams.indexOfFirst { it.label == "Ultrawide" }
@@ -393,15 +398,20 @@ fun ScannerScreen() {
                     modifier = Modifier.padding(4.dp)
                 )
                 Button(
-                    onClick = { lastResult = null; isScanning = true },
+                    onClick = {
+                        lastResult = null
+                        isScanning = true
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Scan Again") }
-                Spacer(Modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(8.dp))
             }
 
             Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 availableCams.forEachIndexed { i, cam ->
@@ -412,7 +422,7 @@ fun ScannerScreen() {
                         ),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                     ) {
-                        Text("${cam.label}", fontSize = 12.sp)
+                        Text(cam.label, fontSize = 12.sp)
                     }
                 }
             }
@@ -433,9 +443,16 @@ fun ScannerScreen() {
             }
 
             Text("Zoom ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                Button(onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) }) { Text("- Zoom") }
-                Button(onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) }) { Text("+ Zoom") }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                Button(onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) }) {
+                    Text("- Zoom")
+                }
+                Button(onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) }) {
+                    Text("+ Zoom")
+                }
                 val flash = availableCams.getOrNull(selectedCamIndex)?.hasFlash == true
                 Button(
                     onClick = { if (flash) torchOn = !torchOn },
@@ -443,12 +460,17 @@ fun ScannerScreen() {
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (torchOn) Color(0xFFFFC107) else Color.DarkGray
                     )
-                ) { Text(if (torchOn) "Torch ON" else "Torch") }
+                ) {
+                    Text(if (torchOn) "Torch ON" else "Torch")
+                }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
                 Button(
                     onClick = {
                         lastFrameBitmap?.let { saveBitmap(it) }
@@ -463,7 +485,11 @@ fun ScannerScreen() {
                 ) { Text("Gallery") }
 
                 Button(
-                    onClick = { isScanning = true; lastResult = null; statusText = "Scanning..." },
+                    onClick = {
+                        isScanning = true
+                        lastResult = null
+                        statusText = "Scanning..."
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
                 ) { Text("Scan") }
             }
