@@ -65,6 +65,36 @@ data class CamOption(
     val minFocusDistance: Float
 )
 
+/** Extract raw Y plane — no JPEG, no quality loss */
+fun ImageProxy.toYPlane(): Pair<ByteArray, Pair<Int, Int>>? {
+    return try {
+        val yPlane = planes[0]
+        val yBuf = yPlane.buffer
+        val pixelStride = yPlane.pixelStride
+        val rowStride = yPlane.rowStride
+        val w = width
+        val h = height
+
+        // Compact to w*h if rowStride != width
+        val data = ByteArray(w * h)
+        if (pixelStride == 1 && rowStride == w) {
+            yBuf.get(data, 0, minOf(yBuf.remaining(), data.size))
+        } else {
+            var pos = 0
+            for (row in 0 until h) {
+                val rowStart = row * rowStride
+                for (col in 0 until w) {
+                    data[pos++] = yBuf.get(rowStart + col * pixelStride)
+                }
+            }
+        }
+        data to (w to h)
+    } catch (e: Exception) {
+        Log.e("TinyQR", "Y plane failed", e)
+        null
+    }
+}
+
 fun ImageProxy.toBitmapSafe(): Bitmap? {
     return try {
         val yBuffer = planes[0].buffer
@@ -83,7 +113,6 @@ fun ImageProxy.toBitmapSafe(): Bitmap? {
         val bytes = out.toByteArray()
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     } catch (e: Exception) {
-        Log.e("TinyQR", "toBitmap failed", e)
         null
     }
 }
@@ -124,8 +153,7 @@ fun ScannerScreen() {
                 statusText = "Cannot open image"
                 return@rememberLauncherForActivityResult
             }
-            statusText = "Decoding Data Matrix..."
-
+            statusText = "Decoding..."
             val zx = QrDecoder.decode(bitmap)
             if (zx != null) {
                 lastResult = zx.first
@@ -133,7 +161,6 @@ fun ScannerScreen() {
                 statusText = "Found!"
                 return@rememberLauncherForActivityResult
             }
-
             val options = BarcodeScannerOptions.Builder()
                 .setBarcodeFormats(
                     Barcode.FORMAT_DATA_MATRIX,
@@ -148,15 +175,12 @@ fun ScannerScreen() {
                     if (list.isNotEmpty()) {
                         lastResult = list[0].rawValue
                         isScanning = false
-                        statusText = "Found (ML Kit)!"
-                    } else {
-                        statusText = "No code found"
-                    }
+                        statusText = "Found!"
+                    } else statusText = "No code found"
                 }
                 .addOnFailureListener { statusText = "Decode error" }
         } catch (e: Exception) {
             statusText = "Image error"
-            Log.e("TinyQR", "gallery", e)
         }
     }
 
@@ -176,9 +200,8 @@ fun ScannerScreen() {
                     bitmap.compress(Bitmap.CompressFormat.JPEG, 100, it)
                 }
                 Toast.makeText(context, "Saved $name", Toast.LENGTH_SHORT).show()
-                statusText = "Saved"
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             Toast.makeText(context, "Save failed", Toast.LENGTH_SHORT).show()
         }
     }
@@ -197,9 +220,7 @@ fun ScannerScreen() {
         try {
             if (camera?.cameraInfo?.hasFlashUnit() == true) {
                 camera?.cameraControl?.enableTorch(torchOn)
-            } else {
-                torchOn = false
-            }
+            } else torchOn = false
         } catch (_: Exception) {
         }
     }
@@ -235,6 +256,7 @@ fun ScannerScreen() {
 
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
 
             val mlOptions = BarcodeScannerOptions.Builder()
@@ -253,31 +275,43 @@ fun ScannerScreen() {
                     return@setAnalyzer
                 }
                 try {
-                    val bmp = proxy.toBitmapSafe()
-                    if (bmp == null) {
-                        proxy.close()
-                        return@setAnalyzer
-                    }
-                    lastFrameBitmap = bmp.copy(bmp.config ?: Bitmap.Config.ARGB_8888, false)
-
-                    val result = QrDecoder.decode(bmp)
-                    if (result != null) {
-                        lastResult = result.first
-                        isScanning = false
-                        statusText = "Found!"
-                        proxy.close()
-                        return@setAnalyzer
-                    }
-
-                    ml.process(InputImage.fromBitmap(bmp, proxy.imageInfo.rotationDegrees))
-                        .addOnSuccessListener { codes ->
-                            if (codes.isNotEmpty()) {
-                                lastResult = codes[0].rawValue
-                                isScanning = false
-                                statusText = "Found (ML)!"
+                    // Path 1: raw Y plane → ZXing DataMatrixReader (no JPEG loss)
+                    val yPair = proxy.toYPlane()
+                    if (yPair != null) {
+                        val (yData, size) = yPair
+                        val text = QrDecoder.decodeYuv(yData, size.first, size.second)
+                        if (text != null) {
+                            lastResult = text
+                            isScanning = false
+                            statusText = "Found!"
+                            // keep a bitmap for capture if possible
+                            proxy.toBitmapSafe()?.let {
+                                lastFrameBitmap = it
                             }
+                            proxy.close()
+                            return@setAnalyzer
                         }
-                        .addOnCompleteListener { proxy.close() }
+                    }
+
+                    // Path 2: ML Kit on media image
+                    val media = proxy.image
+                    if (media != null) {
+                        val image = InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees)
+                        ml.process(image)
+                            .addOnSuccessListener { codes ->
+                                if (codes.isNotEmpty()) {
+                                    lastResult = codes[0].rawValue
+                                    isScanning = false
+                                    statusText = "Found!"
+                                }
+                            }
+                            .addOnCompleteListener {
+                                proxy.toBitmapSafe()?.let { lastFrameBitmap = it }
+                                proxy.close()
+                            }
+                    } else {
+                        proxy.close()
+                    }
                 } catch (e: Exception) {
                     Log.e("TinyQR", "analyze", e)
                     proxy.close()
@@ -300,7 +334,7 @@ fun ScannerScreen() {
                 }
             }
 
-            statusText = "${option.label} | Data Matrix mode"
+            statusText = "${option.label} | Data Matrix"
             torchOn = false
         } catch (e: Exception) {
             Log.e("TinyQR", "bind", e)
@@ -346,8 +380,8 @@ fun ScannerScreen() {
                         availableCams = cams.sortedBy { it.focalLength }
                         val uw = availableCams.indexOfFirst { it.label == "Ultrawide" }
                         selectedCamIndex = if (uw >= 0) uw else 0
-                        statusText = "${availableCams.size} cameras | Data Matrix"
-                    } catch (e: Exception) {
+                        statusText = "${availableCams.size} cams | Data Matrix"
+                    } catch (_: Exception) {
                         statusText = "Init failed"
                     }
                 }, ContextCompat.getMainExecutor(ctx))
@@ -372,7 +406,7 @@ fun ScannerScreen() {
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "Data Matrix industrial mode",
+                text = "Raw Y → DataMatrixReader (no JPEG)",
                 color = Color.Cyan,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
@@ -421,9 +455,7 @@ fun ScannerScreen() {
                             containerColor = if (selectedCamIndex == i) Color(0xFF2196F3) else Color.DarkGray
                         ),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Text(cam.label, fontSize = 12.sp)
-                    }
+                    ) { Text(cam.label, fontSize = 12.sp) }
                 }
             }
 
@@ -460,9 +492,7 @@ fun ScannerScreen() {
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (torchOn) Color(0xFFFFC107) else Color.DarkGray
                     )
-                ) {
-                    Text(if (torchOn) "Torch ON" else "Torch")
-                }
+                ) { Text(if (torchOn) "Torch ON" else "Torch") }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
