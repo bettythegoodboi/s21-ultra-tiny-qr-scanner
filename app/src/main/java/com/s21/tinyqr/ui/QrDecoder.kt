@@ -15,12 +15,6 @@ import com.google.zxing.datamatrix.DataMatrixReader
 import java.util.EnumSet
 import java.util.Hashtable
 
-/**
- * Simple correct decoder for short industrial Data Matrix.
- * Content example: 00086192327
- *
- * Key: feed clean luminance, try DataMatrixReader first, avoid destructive filters.
- */
 object QrDecoder {
 
     private fun hintsDm(): Hashtable<DecodeHintType, Any> {
@@ -45,7 +39,6 @@ object QrDecoder {
     }
 
     private fun decodeSource(source: LuminanceSource): String? {
-        // 1) Dedicated Data Matrix reader (correct for this use case)
         val dmReader = DataMatrixReader()
         try {
             val r = dmReader.decode(BinaryBitmap(HybridBinarizer(source)), hintsDm())
@@ -60,7 +53,6 @@ object QrDecoder {
         } catch (_: Exception) {
         }
 
-        // 2) MultiFormat fallback
         val multi = MultiFormatReader()
         multi.setHints(hintsAll())
         try {
@@ -71,25 +63,22 @@ object QrDecoder {
         }
         try {
             val r = multi.decodeWithState(BinaryBitmap(GlobalHistogramBinarizer(source)))
-            Log.d("TinyQR", "Multi global ${r.barcodeFormat}: ${r.text}")
+            Log.d("TinyQR", "Multi global: ${r.text}")
             return r.text
         } catch (_: Exception) {
         }
         return null
     }
 
-    /** Preferred path: raw camera Y plane (no JPEG loss) */
     fun decodeYuv(yData: ByteArray, width: Int, height: Int): String? {
         if (width < 16 || height < 16) return null
 
-        // Full frame
         try {
             val full = PlanarYUVLuminanceSource(yData, width, height, 0, 0, width, height, false)
             decodeSource(full)?.let { return it }
         } catch (_: Exception) {
         }
 
-        // Center crops at several sizes — tiny code is usually centered when user aims
         for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f, 0.7f)) {
             val cw = (width * ratio).toInt().coerceAtLeast(32)
             val ch = (height * ratio).toInt().coerceAtLeast(32)
@@ -107,49 +96,114 @@ object QrDecoder {
         return null
     }
 
-    /** Bitmap path (gallery / captured JPEG) */
-    fun decode(bitmap: Bitmap): Pair<String, String>? {
+    private fun tryBitmapRegion(bitmap: Bitmap): String? {
         val w = bitmap.width
         val h = bitmap.height
         if (w < 16 || h < 16) return null
-
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        return try {
+            decodeSource(RGBLuminanceSource(w, h, pixels))
+        } catch (_: Exception) {
+            null
+        }
+    }
 
-        // Full
+    private fun scaleIfNeeded(src: Bitmap, minSide: Int = 180): Bitmap {
+        val min = minOf(src.width, src.height)
+        if (min >= minSide) return src
+        val f = minSide.toFloat() / min
+        return Bitmap.createScaledBitmap(
+            src,
+            (src.width * f).toInt().coerceAtLeast(1),
+            (src.height * f).toInt().coerceAtLeast(1),
+            true
+        )
+    }
+
+    /**
+     * Gallery / still image path.
+     * Searches multiple regions because the code is often NOT centered.
+     */
+    fun decode(bitmap: Bitmap): Pair<String, String>? {
+        // Shrink huge photos for speed (keep detail)
+        var work = bitmap
+        val maxSide = 1600
+        if (maxOf(bitmap.width, bitmap.height) > maxSide) {
+            val s = maxSide.toFloat() / maxOf(bitmap.width, bitmap.height)
+            work = Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * s).toInt(),
+                (bitmap.height * s).toInt(),
+                true
+            )
+        }
+
+        // 1) Full image
+        tryBitmapRegion(work)?.let {
+            if (work !== bitmap) work.recycle()
+            return it to "full"
+        }
+
+        val w = work.width
+        val h = work.height
+
+        // 2) Grid of crops — code can be anywhere in the photo
+        // 3x3 positions x several sizes
+        val sizes = listOf(0.35f, 0.5f, 0.65f, 0.25f)
+        val positions = listOf(
+            0.0f to 0.0f,   // top-left
+            0.5f to 0.0f,   // top-center
+            1.0f to 0.0f,   // top-right
+            0.0f to 0.5f,   // mid-left
+            0.5f to 0.5f,   // center
+            1.0f to 0.5f,   // mid-right
+            0.0f to 1.0f,   // bot-left
+            0.5f to 1.0f,   // bot-center
+            1.0f to 1.0f    // bot-right
+        )
+
+        for (sizeRatio in sizes) {
+            val cw = (w * sizeRatio).toInt().coerceAtLeast(40)
+            val ch = (h * sizeRatio).toInt().coerceAtLeast(40)
+            for ((px, py) in positions) {
+                val left = ((w - cw) * px).toInt().coerceIn(0, maxOf(0, w - cw))
+                val top = ((h - ch) * py).toInt().coerceIn(0, maxOf(0, h - ch))
+                val rw = minOf(cw, w - left)
+                val rh = minOf(ch, h - top)
+                if (rw < 32 || rh < 32) continue
+
+                try {
+                    val crop = Bitmap.createBitmap(work, left, top, rw, rh)
+                    val scaled = scaleIfNeeded(crop, 200)
+                    tryBitmapRegion(scaled)?.let {
+                        if (scaled !== crop) scaled.recycle()
+                        if (crop !== work) crop.recycle()
+                        if (work !== bitmap) work.recycle()
+                        return it to "region"
+                    }
+                    if (scaled !== crop) scaled.recycle()
+                    if (crop !== work) crop.recycle()
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        // 3) Whole image mild upscale once
         try {
-            decodeSource(RGBLuminanceSource(w, h, pixels))?.let { return it to "full" }
+            val up = scaleIfNeeded(work, 400)
+            if (up !== work) {
+                tryBitmapRegion(up)?.let {
+                    up.recycle()
+                    if (work !== bitmap) work.recycle()
+                    return it to "up"
+                }
+                up.recycle()
+            }
         } catch (_: Exception) {
         }
 
-        // Center crops
-        for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f)) {
-            val cw = (w * ratio).toInt().coerceAtLeast(32)
-            val ch = (h * ratio).toInt().coerceAtLeast(32)
-            val left = ((w - cw) / 2).coerceAtLeast(0)
-            val top = ((h - ch) / 2).coerceAtLeast(0)
-            val rw = minOf(cw, w - left)
-            val rh = minOf(ch, h - top)
-            try {
-                val cropBmp = Bitmap.createBitmap(bitmap, left, top, rw, rh)
-                // Mild upscale if crop is small
-                val target = if (rw < 200 || rh < 200) {
-                    val f = 200f / minOf(rw, rh)
-                    Bitmap.createScaledBitmap(cropBmp, (rw * f).toInt(), (rh * f).toInt(), true)
-                } else cropBmp
-
-                val cp = IntArray(target.width * target.height)
-                target.getPixels(cp, 0, target.width, 0, 0, target.width, target.height)
-                decodeSource(RGBLuminanceSource(target.width, target.height, cp))?.let {
-                    if (target !== cropBmp) target.recycle()
-                    if (cropBmp !== bitmap) cropBmp.recycle()
-                    return it to "crop"
-                }
-                if (target !== cropBmp) target.recycle()
-                if (cropBmp !== bitmap) cropBmp.recycle()
-            } catch (_: Exception) {
-            }
-        }
+        if (work !== bitmap) work.recycle()
         return null
     }
 }
