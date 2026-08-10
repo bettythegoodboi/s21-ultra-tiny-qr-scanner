@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -79,9 +80,9 @@ fun ImageProxy.toBitmapSafe(): Bitmap? {
         uBuffer.get(nv21, ySize + vSize, uSize)
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, width, height), 95, out)
-        val imageBytes = out.toByteArray()
-        BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), 100, out)
+        val bytes = out.toByteArray()
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     } catch (e: Exception) {
         Log.e("TinyQR", "toBitmap failed", e)
         null
@@ -96,9 +97,9 @@ fun ScannerScreen() {
 
     var lastResult by remember { mutableStateOf<String?>(null) }
     var isScanning by remember { mutableStateOf(true) }
-    var zoomRatio by remember { mutableStateOf(3.0f) }
+    var zoomRatio by remember { mutableStateOf(4.0f) }
     var torchOn by remember { mutableStateOf(false) }
-    var statusText by remember { mutableStateOf("Loading cameras...") }
+    var statusText by remember { mutableStateOf("Loading...") }
     var availableCams by remember { mutableStateOf<List<CamOption>>(emptyList()) }
     var selectedCamIndex by remember { mutableStateOf(0) }
     var camera by remember { mutableStateOf<Camera?>(null) }
@@ -106,97 +107,90 @@ fun ScannerScreen() {
     var providerRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     var lastFrameBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-    var manualFocusEnabled by remember { mutableStateOf(false) }
+    var manualFocusEnabled by remember { mutableStateOf(true) }
     var focusDistance by remember { mutableStateOf(0f) }
     var maxFocusDistance by remember { mutableStateOf(10f) }
-    var enhanceEnabled by remember { mutableStateOf(true) }
 
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
-    // Gallery picker - use the correct multi-format decoder
     val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
         try {
-            val inputStream = context.contentResolver.openInputStream(uri)
-            val bitmap = BitmapFactory.decodeStream(inputStream)
-            inputStream?.close()
-            if (bitmap != null) {
-                statusText = "Decoding image..."
-
-                // 1) Correct ZXing multi-format decoder
-                val zxResult = QrDecoder.decode(bitmap)
-                if (zxResult != null) {
-                    lastResult = zxResult.first
-                    isScanning = false
-                    statusText = "Found (${zxResult.second})!"
-                    return@rememberLauncherForActivityResult
-                }
-
-                // 2) ML Kit multi-format
-                val options = BarcodeScannerOptions.Builder()
-                    .setBarcodeFormats(
-                        Barcode.FORMAT_QR_CODE,
-                        Barcode.FORMAT_DATA_MATRIX,
-                        Barcode.FORMAT_AZTEC,
-                        Barcode.FORMAT_PDF417
-                    )
-                    .build()
-                val scanner = BarcodeScanning.getClient(options)
-                val image = InputImage.fromBitmap(bitmap, 0)
-                scanner.process(image)
-                    .addOnSuccessListener { barcodes ->
-                        if (barcodes.isNotEmpty()) {
-                            lastResult = barcodes[0].rawValue
-                            isScanning = false
-                            statusText = "Found (ML Kit)!"
-                        } else {
-                            statusText = "No 2D code found in image"
-                        }
-                    }
-                    .addOnFailureListener {
-                        statusText = "Decode failed"
-                    }
+            val stream = context.contentResolver.openInputStream(uri)
+            val bitmap = BitmapFactory.decodeStream(stream)
+            stream?.close()
+            if (bitmap == null) {
+                statusText = "Cannot open image"
+                return@rememberLauncherForActivityResult
             }
+            statusText = "Decoding Data Matrix..."
+
+            // ZXing Data Matrix hardened path
+            val zx = QrDecoder.decode(bitmap)
+            if (zx != null) {
+                lastResult = zx.first
+                isScanning = false
+                statusText = "Found!"
+                return@rememberLauncherForActivityResult
+            }
+
+            // ML Kit Data Matrix
+            val options = BarcodeScannerOptions.Builder()
+                .setBarcodeFormats(
+                    Barcode.FORMAT_DATA_MATRIX,
+                    Barcode.FORMAT_QR_CODE,
+                    Barcode.FORMAT_AZTEC,
+                    Barcode.FORMAT_PDF417
+                )
+                .build()
+            BarcodeScanning.getClient(options)
+                .process(InputImage.fromBitmap(bitmap, 0))
+                .addOnSuccessListener { list ->
+                    if (list.isNotEmpty()) {
+                        lastResult = list[0].rawValue
+                        isScanning = false
+                        statusText = "Found (ML Kit)!"
+                    } else {
+                        statusText = "No code found"
+                    }
+                }
+                .addOnFailureListener { statusText = "Decode error" }
         } catch (e: Exception) {
-            statusText = "Failed to open image"
-            Log.e("TinyQR", "Gallery error", e)
+            statusText = "Image error"
+            Log.e("TinyQR", "gallery", e)
         }
     }
 
-    fun saveBitmapToGallery(bitmap: Bitmap) {
+    fun saveBitmap(bitmap: Bitmap) {
         try {
-            val filename = "TinyQR_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
-            val contentValues = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            val name = "DM_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
                 put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/TinyQR")
                 }
             }
-            val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             if (uri != null) {
-                context.contentResolver.openOutputStream(uri)?.use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                context.contentResolver.openOutputStream(uri)?.use {
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 100, it)
                 }
-                Toast.makeText(context, "Saved: $filename", Toast.LENGTH_SHORT).show()
-                statusText = "Image saved"
+                Toast.makeText(context, "Saved $name", Toast.LENGTH_SHORT).show()
+                statusText = "Saved"
             }
         } catch (e: Exception) {
             Toast.makeText(context, "Save failed", Toast.LENGTH_SHORT).show()
-            Log.e("TinyQR", "Save error", e)
         }
     }
 
     LaunchedEffect(zoomRatio, camera) {
         try {
             camera?.let {
-                val zoomState = it.cameraInfo.zoomState.value
-                if (zoomState != null) {
-                    val clamped = zoomRatio.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
-                    it.cameraControl.setZoomRatio(clamped)
-                }
+                val zs = it.cameraInfo.zoomState.value ?: return@let
+                it.cameraControl.setZoomRatio(zoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
             }
         } catch (_: Exception) {}
     }
@@ -205,153 +199,124 @@ fun ScannerScreen() {
         try {
             if (camera?.cameraInfo?.hasFlashUnit() == true) {
                 camera?.cameraControl?.enableTorch(torchOn)
-            } else {
-                torchOn = false
-            }
+            } else torchOn = false
         } catch (_: Exception) {}
     }
 
-    fun bindSelectedCamera() {
+    fun bindCamera() {
         val provider = providerRef ?: return
         val previewView = previewViewRef ?: return
         if (availableCams.isEmpty()) return
-
         val option = availableCams.getOrNull(selectedCamIndex) ?: return
 
         try {
             provider.unbindAll()
 
             val previewBuilder = Preview.Builder()
-
             if (manualFocusEnabled && option.minFocusDistance > 0f) {
-                val extender = Camera2Interop.Extender(previewBuilder)
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_OFF
-                )
-                val diopters = focusDistance.coerceIn(0f, option.minFocusDistance)
-                extender.setCaptureRequestOption(
+                val ext = Camera2Interop.Extender(previewBuilder)
+                ext.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                ext.setCaptureRequestOption(
                     CaptureRequest.LENS_FOCUS_DISTANCE,
-                    diopters
+                    focusDistance.coerceIn(0f, option.minFocusDistance)
                 )
             }
-
-            val preview = previewBuilder.build().also {
-                it.surfaceProvider = previewView.surfaceProvider
-            }
+            val preview = previewBuilder.build().also { it.surfaceProvider = previewView.surfaceProvider }
 
             val selector = CameraSelector.Builder()
                 .addCameraFilter { list -> list.filter { it == option.cameraInfo } }
                 .build()
 
+            // Higher resolution analysis for tiny Data Matrix
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setTargetResolution(Size(1920, 1080))
                 .build()
 
-            // ML Kit configured for all common 2D formats
             val mlOptions = BarcodeScannerOptions.Builder()
                 .setBarcodeFormats(
-                    Barcode.FORMAT_QR_CODE,
                     Barcode.FORMAT_DATA_MATRIX,
+                    Barcode.FORMAT_QR_CODE,
                     Barcode.FORMAT_AZTEC,
                     Barcode.FORMAT_PDF417
                 )
                 .build()
-            val mlScanner = BarcodeScanning.getClient(mlOptions)
+            val ml = BarcodeScanning.getClient(mlOptions)
 
-            analysis.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
+            analysis.setAnalyzer(Executors.newSingleThreadExecutor()) { proxy ->
                 if (!isScanning) {
-                    imageProxy.close()
+                    proxy.close()
                     return@setAnalyzer
                 }
-
                 try {
-                    val bitmap = imageProxy.toBitmapSafe()
-                    if (bitmap == null) {
-                        imageProxy.close()
+                    val bmp = proxy.toBitmapSafe()
+                    if (bmp == null) {
+                        proxy.close()
                         return@setAnalyzer
                     }
+                    lastFrameBitmap = bmp.copy(bmp.config ?: Bitmap.Config.ARGB_8888, false)
 
-                    lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
-
-                    // 1) Correct multi-format ZXing decoder
-                    val zxResult = QrDecoder.decode(bitmap)
-                    if (zxResult != null) {
-                        lastResult = zxResult.first
+                    // Primary: hardened Data Matrix decoder
+                    val result = QrDecoder.decode(bmp)
+                    if (result != null) {
+                        lastResult = result.first
                         isScanning = false
-                        statusText = "Found (${zxResult.second})!"
-                        imageProxy.close()
+                        statusText = "Found!"
+                        proxy.close()
                         return@setAnalyzer
                     }
 
-                    // 2) ML Kit multi-format fallback
-                    val image = InputImage.fromBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
-                    mlScanner.process(image)
-                        .addOnSuccessListener { barcodes ->
-                            if (barcodes.isNotEmpty()) {
-                                lastResult = barcodes[0].rawValue
+                    // Fallback ML Kit
+                    ml.process(InputImage.fromBitmap(bmp, proxy.imageInfo.rotationDegrees))
+                        .addOnSuccessListener { codes ->
+                            if (codes.isNotEmpty()) {
+                                lastResult = codes[0].rawValue
                                 isScanning = false
-                                statusText = "Found (ML Kit)!"
+                                statusText = "Found (ML)!"
                             }
                         }
-                        .addOnCompleteListener {
-                            imageProxy.close()
-                        }
+                        .addOnCompleteListener { proxy.close() }
                 } catch (e: Exception) {
-                    Log.e("TinyQR", "Analysis error", e)
-                    imageProxy.close()
+                    Log.e("TinyQR", "analyze", e)
+                    proxy.close()
                 }
             }
 
-            val cam = provider.bindToLifecycle(
-                lifecycleOwner,
-                selector,
-                preview,
-                analysis
-            )
+            val cam = provider.bindToLifecycle(lifecycleOwner, selector, preview, analysis)
             camera = cam
-
             maxFocusDistance = if (option.minFocusDistance > 0f) option.minFocusDistance else 10f
 
             if (!manualFocusEnabled) {
                 try {
                     val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
-                    val point = factory.createPoint(0.5f, 0.5f)
-                    val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
-                        .setAutoCancelDuration(2, TimeUnit.SECONDS)
-                        .build()
+                    val action = FocusMeteringAction.Builder(
+                        factory.createPoint(0.5f, 0.5f), FocusMeteringAction.FLAG_AF
+                    ).setAutoCancelDuration(2, TimeUnit.SECONDS).build()
                     cam.cameraControl.startFocusAndMetering(action)
                 } catch (_: Exception) {}
             }
 
-            statusText = "${option.label} | Ready to scan 2D codes"
+            statusText = "${option.label} | Data Matrix mode"
             torchOn = false
-
         } catch (e: Exception) {
-            Log.e("TinyQR", "Bind failed", e)
-            statusText = "Error: ${e.message?.take(40)}"
+            Log.e("TinyQR", "bind", e)
+            statusText = "Camera error"
         }
     }
 
     LaunchedEffect(selectedCamIndex, availableCams, manualFocusEnabled, focusDistance) {
-        if (availableCams.isNotEmpty()) {
-            bindSelectedCamera()
-        }
+        if (availableCams.isNotEmpty()) bindCamera()
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-
+    Box(Modifier = Modifier.fillMaxSize()) {
         AndroidView(
             factory = { ctx ->
-                val previewView = PreviewView(ctx)
-                previewViewRef = previewView
-                val executor = ContextCompat.getMainExecutor(ctx)
-
+                val pv = PreviewView(ctx)
+                previewViewRef = pv
                 cameraProviderFuture.addListener({
                     try {
                         val provider = cameraProviderFuture.get()
                         providerRef = provider
-
                         val cams = mutableListOf<CamOption>()
                         for (info in provider.availableCameraInfos) {
                             if (info.lensFacing != CameraSelector.LENS_FACING_BACK) continue
@@ -361,130 +326,104 @@ fun ScannerScreen() {
                                     CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
                                 )
                                 val focal = focals?.firstOrNull() ?: 0f
-                                val hasFlash = info.hasFlashUnit()
-                                val minFocus = c2.getCameraCharacteristic(
+                                val minF = c2.getCameraCharacteristic(
                                     CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE
                                 ) ?: 0f
-
                                 val label = when {
                                     focal < 2.5f -> "Ultrawide"
                                     focal < 7f -> "Main"
                                     focal < 20f -> "3x Tele"
                                     else -> "10x Tele"
                                 }
-                                cams.add(CamOption(label, info, focal, hasFlash, minFocus))
-                            } catch (e: Exception) {
-                                Log.e("TinyQR", "Cam info error", e)
-                            }
+                                cams.add(CamOption(label, info, focal, info.hasFlashUnit(), minF))
+                            } catch (_: Exception) {}
                         }
-
                         availableCams = cams.sortedBy { it.focalLength }
-                        val uwIndex = availableCams.indexOfFirst { it.label == "Ultrawide" }
-                        selectedCamIndex = if (uwIndex >= 0) uwIndex else 0
-                        statusText = "Found ${availableCams.size} cameras"
+                        val uw = availableCams.indexOfFirst { it.label == "Ultrawide" }
+                        selectedCamIndex = if (uw >= 0) uw else 0
+                        statusText = "${availableCams.size} cameras | Data Matrix"
                     } catch (e: Exception) {
-                        statusText = "Camera init failed"
-                        Log.e("TinyQR", "Init failed", e)
+                        statusText = "Init failed"
                     }
-                }, executor)
-
-                previewView
+                }, ContextCompat.getMainExecutor(ctx))
+                pv
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // Top status
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
-                .background(Color.Black.copy(alpha = 0.7f))
+                .background(Color.Black.copy(alpha = 0.75f))
                 .padding(10.dp)
         ) {
             Text(
-                text = if (isScanning) statusText else "Code Found!",
+                text = if (isScanning) statusText else "CODE FOUND",
                 color = Color.White,
-                fontSize = 15.sp,
+                fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "Supports: QR / DataMatrix / Aztec / PDF417",
-                color = Color.LightGray,
+                text = "Data Matrix industrial mode",
+                color = Color.Cyan,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
             )
         }
 
-        // Bottom panel
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color.Black.copy(alpha = 0.88f))
+                .background(Color.Black.copy(alpha = 0.9f))
                 .padding(10.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-
             if (lastResult != null) {
                 Text("Result:", color = Color.White, fontSize = 12.sp)
                 Text(
                     text = lastResult ?: "",
                     color = Color.Green,
-                    fontSize = 15.sp,
+                    fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(vertical = 4.dp)
+                    modifier = Modifier.padding(4.dp)
                 )
                 Button(
-                    onClick = {
-                        lastResult = null
-                        isScanning = true
-                    },
+                    onClick = { lastResult = null; isScanning = true },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
                     modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Scan Again")
-                }
-                Spacer(modifier = Modifier.height(8.dp))
+                ) { Text("Scan Again") }
+                Spacer(Modifier = Modifier.height(8.dp))
             }
 
-            Text("Camera (${availableCams.size}):", color = Color.White, fontSize = 12.sp)
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                availableCams.forEachIndexed { index, cam ->
+                availableCams.forEachIndexed { i, cam ->
                     Button(
-                        onClick = { selectedCamIndex = index },
+                        onClick = { selectedCamIndex = i },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (selectedCamIndex == index) Color(0xFF2196F3) else Color.DarkGray
+                            containerColor = if (selectedCamIndex == i) Color(0xFF2196F3) else Color.DarkGray
                         ),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                     ) {
-                        Text("${cam.label}\n${String.format("%.1f", cam.focalLength)}mm", fontSize = 11.sp)
+                        Text("${cam.label}", fontSize = 12.sp)
                     }
                 }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Manual Focus", color = Color.White, fontSize = 13.sp)
-                    Switch(checked = manualFocusEnabled, onCheckedChange = { manualFocusEnabled = it })
-                }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Manual Focus", color = Color.White, fontSize = 13.sp)
+                Switch(checked = manualFocusEnabled, onCheckedChange = { manualFocusEnabled = it })
             }
-
             if (manualFocusEnabled) {
-                Text("Focus (closer ← → far)", color = Color.LightGray, fontSize = 11.sp)
                 Slider(
                     value = focusDistance,
                     onValueChange = { focusDistance = it },
@@ -493,44 +432,27 @@ fun ScannerScreen() {
                 )
             }
 
-            Text("Zoom: ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
+            Text("Zoom ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                Button(onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) }) { Text("- Zoom") }
+                Button(onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) }) { Text("+ Zoom") }
+                val flash = availableCams.getOrNull(selectedCamIndex)?.hasFlash == true
                 Button(
-                    onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
-                ) { Text("- Zoom") }
-
-                Button(
-                    onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
-                ) { Text("+ Zoom") }
-
-                val hasFlash = availableCams.getOrNull(selectedCamIndex)?.hasFlash == true
-                Button(
-                    onClick = { if (hasFlash) torchOn = !torchOn },
-                    enabled = hasFlash,
+                    onClick = { if (flash) torchOn = !torchOn },
+                    enabled = flash,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (torchOn) Color(0xFFFFC107) else Color.DarkGray,
-                        disabledContainerColor = Color.Gray
+                        containerColor = if (torchOn) Color(0xFFFFC107) else Color.DarkGray
                     )
-                ) {
-                    Text(if (!hasFlash) "No Flash" else if (torchOn) "Torch ON" else "Torch")
-                }
+                ) { Text(if (torchOn) "Torch ON" else "Torch") }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                 Button(
                     onClick = {
-                        lastFrameBitmap?.let { saveBitmapToGallery(it) }
-                            ?: Toast.makeText(context, "No frame yet", Toast.LENGTH_SHORT).show()
+                        lastFrameBitmap?.let { saveBitmap(it) }
+                            ?: Toast.makeText(context, "No frame", Toast.LENGTH_SHORT).show()
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF9C27B0))
                 ) { Text("Capture") }
@@ -541,21 +463,10 @@ fun ScannerScreen() {
                 ) { Text("Gallery") }
 
                 Button(
-                    onClick = {
-                        isScanning = true
-                        lastResult = null
-                        statusText = "Scanning..."
-                    },
+                    onClick = { isScanning = true; lastResult = null; statusText = "Scanning..." },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
-                ) { Text("Scan Now") }
+                ) { Text("Scan") }
             }
-
-            Text(
-                text = "Formats: QR + DataMatrix + Aztec + PDF417",
-                color = Color.Gray,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(top = 4.dp)
-            )
         }
     }
 }
