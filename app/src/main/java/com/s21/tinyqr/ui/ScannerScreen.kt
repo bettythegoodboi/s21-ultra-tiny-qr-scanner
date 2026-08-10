@@ -3,11 +3,7 @@ package com.s21.tinyqr.ui
 import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
 import android.graphics.ImageFormat
-import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraCharacteristics
@@ -54,15 +50,9 @@ import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
-import com.google.zxing.BinaryBitmap
-import com.google.zxing.DecodeHintType
-import com.google.zxing.MultiFormatReader
-import com.google.zxing.RGBLuminanceSource
-import com.google.zxing.common.HybridBinarizer
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
-import java.util.EnumMap
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -98,54 +88,6 @@ fun ImageProxy.toBitmapSafe(): Bitmap? {
     }
 }
 
-fun processForQr(src: Bitmap, strong: Boolean = true): Bitmap {
-    val result = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
-    val canvas = Canvas(result)
-    val paint = Paint()
-    val contrast = if (strong) 1.9f else 1.4f
-    val translate = (-0.5f * contrast + 0.5f) * 255f
-    val cm = ColorMatrix(
-        floatArrayOf(
-            contrast, 0f, 0f, 0f, translate,
-            0f, contrast, 0f, 0f, translate,
-            0f, 0f, contrast, 0f, translate,
-            0f, 0f, 0f, 1f, 0f
-        )
-    )
-    val gray = ColorMatrix()
-    gray.setSaturation(0f)
-    cm.postConcat(gray)
-    paint.colorFilter = ColorMatrixColorFilter(cm)
-    canvas.drawBitmap(src, 0f, 0f, paint)
-    return result
-}
-
-/** Try ZXing decoder - often better on tiny / low-contrast codes */
-fun decodeWithZxing(bitmap: Bitmap): String? {
-    return try {
-        val width = bitmap.width
-        val height = bitmap.height
-        val pixels = IntArray(width * height)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-        val source = RGBLuminanceSource(width, height, pixels)
-        val binary = BinaryBitmap(HybridBinarizer(source))
-        val hints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java)
-        hints[DecodeHintType.TRY_HARDER] = true
-        hints[DecodeHintType.POSSIBLE_FORMATS] = listOf(
-            com.google.zxing.BarcodeFormat.QR_CODE,
-            com.google.zxing.BarcodeFormat.DATA_MATRIX,
-            com.google.zxing.BarcodeFormat.AZTEC,
-            com.google.zxing.BarcodeFormat.PDF_417
-        )
-        val reader = MultiFormatReader()
-        reader.setHints(hints)
-        val result = reader.decodeWithState(binary)
-        result.text
-    } catch (e: Exception) {
-        null
-    }
-}
-
 @OptIn(ExperimentalCamera2Interop::class)
 @Composable
 fun ScannerScreen() {
@@ -171,7 +113,7 @@ fun ScannerScreen() {
 
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
-    // Gallery picker
+    // Gallery picker - use the correct multi-format decoder
     val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -182,41 +124,40 @@ fun ScannerScreen() {
             inputStream?.close()
             if (bitmap != null) {
                 statusText = "Decoding image..."
-                // Try both processed and original
-                val processed = processForQr(bitmap, strong = true)
-                var result = decodeWithZxing(processed)
-                if (result == null) result = decodeWithZxing(bitmap)
 
-                // Also try ML Kit on the image
-                if (result == null) {
-                    val image = InputImage.fromBitmap(processed, 0)
-                    val options = BarcodeScannerOptions.Builder()
-                        .setBarcodeFormats(
-                            Barcode.FORMAT_QR_CODE,
-                            Barcode.FORMAT_DATA_MATRIX,
-                            Barcode.FORMAT_AZTEC,
-                            Barcode.FORMAT_PDF417
-                        )
-                        .build()
-                    val scanner = BarcodeScanning.getClient(options)
-                    scanner.process(image)
-                        .addOnSuccessListener { barcodes ->
-                            if (barcodes.isNotEmpty()) {
-                                lastResult = barcodes[0].rawValue
-                                isScanning = false
-                                statusText = "QR Found (from gallery)!"
-                            } else {
-                                statusText = "No QR found in image"
-                            }
-                        }
-                        .addOnFailureListener {
-                            statusText = "Decode failed"
-                        }
-                } else {
-                    lastResult = result
+                // 1) Correct ZXing multi-format decoder
+                val zxResult = QrDecoder.decode(bitmap)
+                if (zxResult != null) {
+                    lastResult = zxResult.first
                     isScanning = false
-                    statusText = "QR Found (ZXing)!"
+                    statusText = "Found (${zxResult.second})!"
+                    return@rememberLauncherForActivityResult
                 }
+
+                // 2) ML Kit multi-format
+                val options = BarcodeScannerOptions.Builder()
+                    .setBarcodeFormats(
+                        Barcode.FORMAT_QR_CODE,
+                        Barcode.FORMAT_DATA_MATRIX,
+                        Barcode.FORMAT_AZTEC,
+                        Barcode.FORMAT_PDF417
+                    )
+                    .build()
+                val scanner = BarcodeScanning.getClient(options)
+                val image = InputImage.fromBitmap(bitmap, 0)
+                scanner.process(image)
+                    .addOnSuccessListener { barcodes ->
+                        if (barcodes.isNotEmpty()) {
+                            lastResult = barcodes[0].rawValue
+                            isScanning = false
+                            statusText = "Found (ML Kit)!"
+                        } else {
+                            statusText = "No 2D code found in image"
+                        }
+                    }
+                    .addOnFailureListener {
+                        statusText = "Decode failed"
+                    }
             }
         } catch (e: Exception) {
             statusText = "Failed to open image"
@@ -307,7 +248,8 @@ fun ScannerScreen() {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
 
-            val options = BarcodeScannerOptions.Builder()
+            // ML Kit configured for all common 2D formats
+            val mlOptions = BarcodeScannerOptions.Builder()
                 .setBarcodeFormats(
                     Barcode.FORMAT_QR_CODE,
                     Barcode.FORMAT_DATA_MATRIX,
@@ -315,7 +257,7 @@ fun ScannerScreen() {
                     Barcode.FORMAT_PDF417
                 )
                 .build()
-            val mlScanner = BarcodeScanning.getClient(options)
+            val mlScanner = BarcodeScanning.getClient(mlOptions)
 
             analysis.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
                 if (!isScanning) {
@@ -330,37 +272,30 @@ fun ScannerScreen() {
                         return@setAnalyzer
                     }
 
-                    // Keep last frame for Capture
                     lastFrameBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
 
-                    val processed = if (enhanceEnabled) processForQr(bitmap, strong = true) else bitmap
-
-                    // 1) Try ZXing first (often better for tiny codes)
-                    val zxingResult = decodeWithZxing(processed)
-                    if (zxingResult != null) {
-                        lastResult = zxingResult
+                    // 1) Correct multi-format ZXing decoder
+                    val zxResult = QrDecoder.decode(bitmap)
+                    if (zxResult != null) {
+                        lastResult = zxResult.first
                         isScanning = false
-                        statusText = "QR Found (ZXing)!"
+                        statusText = "Found (${zxResult.second})!"
                         imageProxy.close()
-                        if (processed !== bitmap) processed.recycle()
                         return@setAnalyzer
                     }
 
-                    // 2) Fallback to ML Kit
-                    val image = InputImage.fromBitmap(processed, imageProxy.imageInfo.rotationDegrees)
+                    // 2) ML Kit multi-format fallback
+                    val image = InputImage.fromBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
                     mlScanner.process(image)
                         .addOnSuccessListener { barcodes ->
-                            for (barcode in barcodes) {
-                                barcode.rawValue?.let { value ->
-                                    lastResult = value
-                                    isScanning = false
-                                    statusText = "QR Found (ML Kit)!"
-                                }
+                            if (barcodes.isNotEmpty()) {
+                                lastResult = barcodes[0].rawValue
+                                isScanning = false
+                                statusText = "Found (ML Kit)!"
                             }
                         }
                         .addOnCompleteListener {
                             imageProxy.close()
-                            if (processed !== bitmap) processed.recycle()
                         }
                 } catch (e: Exception) {
                     Log.e("TinyQR", "Analysis error", e)
@@ -389,7 +324,7 @@ fun ScannerScreen() {
                 } catch (_: Exception) {}
             }
 
-            statusText = "${option.label} | Enhance: ${if (enhanceEnabled) "ON" else "OFF"}"
+            statusText = "${option.label} | Ready to scan 2D codes"
             torchOn = false
 
         } catch (e: Exception) {
@@ -398,7 +333,7 @@ fun ScannerScreen() {
         }
     }
 
-    LaunchedEffect(selectedCamIndex, availableCams, manualFocusEnabled, focusDistance, enhanceEnabled) {
+    LaunchedEffect(selectedCamIndex, availableCams, manualFocusEnabled, focusDistance) {
         if (availableCams.isNotEmpty()) {
             bindSelectedCamera()
         }
@@ -467,7 +402,7 @@ fun ScannerScreen() {
                 .padding(10.dp)
         ) {
             Text(
-                text = if (isScanning) statusText else "QR Code Found!",
+                text = if (isScanning) statusText else "Code Found!",
                 color = Color.White,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold,
@@ -475,7 +410,7 @@ fun ScannerScreen() {
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "Hold 2~5cm | Dual decoder (ZXing + ML Kit)",
+                text = "Supports: QR / DataMatrix / Aztec / PDF417",
                 color = Color.LightGray,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
@@ -515,7 +450,6 @@ fun ScannerScreen() {
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            // Camera selection
             Text("Camera (${availableCams.size}):", color = Color.White, fontSize = 12.sp)
             Row(
                 modifier = Modifier
@@ -538,16 +472,11 @@ fun ScannerScreen() {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Switches
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Enhance", color = Color.White, fontSize = 13.sp)
-                    Switch(checked = enhanceEnabled, onCheckedChange = { enhanceEnabled = it })
-                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Manual Focus", color = Color.White, fontSize = 13.sp)
                     Switch(checked = manualFocusEnabled, onCheckedChange = { manualFocusEnabled = it })
@@ -564,7 +493,6 @@ fun ScannerScreen() {
                 )
             }
 
-            // Zoom
             Text("Zoom: ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -595,7 +523,6 @@ fun ScannerScreen() {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // New: Capture + Gallery + Scan
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
@@ -624,7 +551,7 @@ fun ScannerScreen() {
             }
 
             Text(
-                text = "Best: Ultrawide + Enhance ON + high zoom + Manual Focus",
+                text = "Formats: QR + DataMatrix + Aztec + PDF417",
                 color = Color.Gray,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 4.dp)
