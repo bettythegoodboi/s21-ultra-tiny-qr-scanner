@@ -33,6 +33,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -65,7 +66,6 @@ data class CamOption(
     val minFocusDistance: Float
 )
 
-/** Extract raw Y plane — no JPEG, no quality loss */
 fun ImageProxy.toYPlane(): Pair<ByteArray, Pair<Int, Int>>? {
     return try {
         val yPlane = planes[0]
@@ -74,8 +74,6 @@ fun ImageProxy.toYPlane(): Pair<ByteArray, Pair<Int, Int>>? {
         val rowStride = yPlane.rowStride
         val w = width
         val h = height
-
-        // Compact to w*h if rowStride != width
         val data = ByteArray(w * h)
         if (pixelStride == 1 && rowStride == w) {
             yBuf.get(data, 0, minOf(yBuf.remaining(), data.size))
@@ -275,7 +273,6 @@ fun ScannerScreen() {
                     return@setAnalyzer
                 }
                 try {
-                    // Path 1: raw Y plane → ZXing DataMatrixReader (no JPEG loss)
                     val yPair = proxy.toYPlane()
                     if (yPair != null) {
                         val (yData, size) = yPair
@@ -284,16 +281,12 @@ fun ScannerScreen() {
                             lastResult = text
                             isScanning = false
                             statusText = "Found!"
-                            // keep a bitmap for capture if possible
-                            proxy.toBitmapSafe()?.let {
-                                lastFrameBitmap = it
-                            }
+                            proxy.toBitmapSafe()?.let { lastFrameBitmap = it }
                             proxy.close()
                             return@setAnalyzer
                         }
                     }
 
-                    // Path 2: ML Kit on media image
                     val media = proxy.image
                     if (media != null) {
                         val image = InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees)
@@ -390,36 +383,41 @@ fun ScannerScreen() {
             modifier = Modifier.fillMaxSize()
         )
 
+        // Top status - pad for status bar
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
+                .statusBarsPadding()
                 .background(Color.Black.copy(alpha = 0.75f))
-                .padding(10.dp)
+                .padding(horizontal = 10.dp, vertical = 8.dp)
         ) {
             Text(
                 text = if (isScanning) statusText else "CODE FOUND",
                 color = Color.White,
-                fontSize = 16.sp,
+                fontSize = 15.sp,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "Raw Y → DataMatrixReader (no JPEG)",
+                text = "Raw Y → DataMatrixReader",
                 color = Color.Cyan,
-                fontSize = 12.sp,
+                fontSize = 11.sp,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
             )
         }
 
+        // Bottom panel - pad for nav bar so buttons are clickable
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color.Black.copy(alpha = 0.9f))
-                .padding(10.dp),
+                .navigationBarsPadding()
+                .background(Color.Black.copy(alpha = 0.92f))
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             if (lastResult != null) {
@@ -439,7 +437,7 @@ fun ScannerScreen() {
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Scan Again") }
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(6.dp))
             }
 
             Row(
@@ -454,15 +452,20 @@ fun ScannerScreen() {
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (selectedCamIndex == i) Color(0xFF2196F3) else Color.DarkGray
                         ),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                     ) { Text(cam.label, fontSize = 12.sp) }
                 }
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center
+            ) {
                 Text("Manual Focus", color = Color.White, fontSize = 13.sp)
+                Spacer(modifier = Modifier.width(8.dp))
                 Switch(checked = manualFocusEnabled, onCheckedChange = { manualFocusEnabled = it })
             }
             if (manualFocusEnabled) {
@@ -479,19 +482,22 @@ fun ScannerScreen() {
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
-                Button(onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) }) {
-                    Text("- Zoom")
-                }
-                Button(onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) }) {
-                    Text("+ Zoom")
-                }
+                Button(
+                    onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                ) { Text("- Zoom") }
+                Button(
+                    onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                ) { Text("+ Zoom") }
                 val flash = availableCams.getOrNull(selectedCamIndex)?.hasFlash == true
                 Button(
                     onClick = { if (flash) torchOn = !torchOn },
                     enabled = flash,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (torchOn) Color(0xFFFFC107) else Color.DarkGray
-                    )
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
                 ) { Text(if (torchOn) "Torch ON" else "Torch") }
             }
 
@@ -506,12 +512,14 @@ fun ScannerScreen() {
                         lastFrameBitmap?.let { saveBitmap(it) }
                             ?: Toast.makeText(context, "No frame", Toast.LENGTH_SHORT).show()
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF9C27B0))
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF9C27B0)),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
                 ) { Text("Capture") }
 
                 Button(
                     onClick = { galleryLauncher.launch("image/*") },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00BCD4))
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00BCD4)),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
                 ) { Text("Gallery") }
 
                 Button(
@@ -520,9 +528,13 @@ fun ScannerScreen() {
                         lastResult = null
                         statusText = "Scanning..."
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
                 ) { Text("Scan") }
             }
+
+            // Extra space so last row is fully above nav gestures
+            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 }
