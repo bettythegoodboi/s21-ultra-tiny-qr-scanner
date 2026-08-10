@@ -9,12 +9,11 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        // Try a known Samsung whitelist package name to unlock more cameras
         applicationId = "com.samsung.android.scan3d"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
 
     buildTypes {
@@ -59,7 +58,11 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
+    // ML Kit
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+    // ZXing - often better for tiny / damaged QR
+    implementation("com.google.zxing:core:3.5.3")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
