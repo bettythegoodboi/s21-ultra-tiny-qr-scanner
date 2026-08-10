@@ -41,30 +41,22 @@ object QrDecoder {
     private fun decodeSource(source: LuminanceSource): String? {
         val dmReader = DataMatrixReader()
         try {
-            val r = dmReader.decode(BinaryBitmap(HybridBinarizer(source)), hintsDm())
-            Log.d("TinyQR", "DM: ${r.text}")
-            return r.text
+            return dmReader.decode(BinaryBitmap(HybridBinarizer(source)), hintsDm()).text
         } catch (_: Exception) {
         }
         try {
-            val r = dmReader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hintsDm())
-            Log.d("TinyQR", "DM global: ${r.text}")
-            return r.text
+            return dmReader.decode(BinaryBitmap(GlobalHistogramBinarizer(source)), hintsDm()).text
         } catch (_: Exception) {
         }
 
         val multi = MultiFormatReader()
         multi.setHints(hintsAll())
         try {
-            val r = multi.decodeWithState(BinaryBitmap(HybridBinarizer(source)))
-            Log.d("TinyQR", "Multi ${r.barcodeFormat}: ${r.text}")
-            return r.text
+            return multi.decodeWithState(BinaryBitmap(HybridBinarizer(source))).text
         } catch (_: Exception) {
         }
         try {
-            val r = multi.decodeWithState(BinaryBitmap(GlobalHistogramBinarizer(source)))
-            Log.d("TinyQR", "Multi global: ${r.text}")
-            return r.text
+            return multi.decodeWithState(BinaryBitmap(GlobalHistogramBinarizer(source))).text
         } catch (_: Exception) {
         }
         return null
@@ -72,13 +64,11 @@ object QrDecoder {
 
     fun decodeYuv(yData: ByteArray, width: Int, height: Int): String? {
         if (width < 16 || height < 16) return null
-
         try {
             val full = PlanarYUVLuminanceSource(yData, width, height, 0, 0, width, height, false)
             decodeSource(full)?.let { return it }
         } catch (_: Exception) {
         }
-
         for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f, 0.7f)) {
             val cw = (width * ratio).toInt().coerceAtLeast(32)
             val ch = (height * ratio).toInt().coerceAtLeast(32)
@@ -96,7 +86,7 @@ object QrDecoder {
         return null
     }
 
-    private fun tryBitmapRegion(bitmap: Bitmap): String? {
+    private fun tryBitmap(bitmap: Bitmap): String? {
         val w = bitmap.width
         val h = bitmap.height
         if (w < 16 || h < 16) return null
@@ -109,101 +99,75 @@ object QrDecoder {
         }
     }
 
-    private fun scaleIfNeeded(src: Bitmap, minSide: Int = 180): Bitmap {
-        val min = minOf(src.width, src.height)
-        if (min >= minSide) return src
-        val f = minSide.toFloat() / min
-        return Bitmap.createScaledBitmap(
-            src,
-            (src.width * f).toInt().coerceAtLeast(1),
-            (src.height * f).toInt().coerceAtLeast(1),
-            true
-        )
-    }
-
     /**
-     * Gallery / still image path.
-     * Searches multiple regions because the code is often NOT centered.
+     * Still image / gallery path — try full, crops, and upscales.
      */
     fun decode(bitmap: Bitmap): Pair<String, String>? {
-        // Shrink huge photos for speed (keep detail)
-        var work = bitmap
-        val maxSide = 1600
-        if (maxOf(bitmap.width, bitmap.height) > maxSide) {
-            val s = maxSide.toFloat() / maxOf(bitmap.width, bitmap.height)
-            work = Bitmap.createScaledBitmap(
-                bitmap,
-                (bitmap.width * s).toInt(),
-                (bitmap.height * s).toInt(),
-                true
-            )
-        }
+        Log.d("TinyQR", "Gallery decode ${bitmap.width}x${bitmap.height}")
 
         // 1) Full image
-        tryBitmapRegion(work)?.let {
-            if (work !== bitmap) work.recycle()
-            return it to "full"
-        }
+        tryBitmap(bitmap)?.let { return it to "full" }
 
-        val w = work.width
-        val h = work.height
-
-        // 2) Grid of crops — code can be anywhere in the photo
-        // 3x3 positions x several sizes
-        val sizes = listOf(0.35f, 0.5f, 0.65f, 0.25f)
-        val positions = listOf(
-            0.0f to 0.0f,   // top-left
-            0.5f to 0.0f,   // top-center
-            1.0f to 0.0f,   // top-right
-            0.0f to 0.5f,   // mid-left
-            0.5f to 0.5f,   // center
-            1.0f to 0.5f,   // mid-right
-            0.0f to 1.0f,   // bot-left
-            0.5f to 1.0f,   // bot-center
-            1.0f to 1.0f    // bot-right
-        )
-
-        for (sizeRatio in sizes) {
-            val cw = (w * sizeRatio).toInt().coerceAtLeast(40)
-            val ch = (h * sizeRatio).toInt().coerceAtLeast(40)
-            for ((px, py) in positions) {
-                val left = ((w - cw) * px).toInt().coerceIn(0, maxOf(0, w - cw))
-                val top = ((h - ch) * py).toInt().coerceIn(0, maxOf(0, h - ch))
-                val rw = minOf(cw, w - left)
-                val rh = minOf(ch, h - top)
-                if (rw < 32 || rh < 32) continue
-
-                try {
-                    val crop = Bitmap.createBitmap(work, left, top, rw, rh)
-                    val scaled = scaleIfNeeded(crop, 200)
-                    tryBitmapRegion(scaled)?.let {
-                        if (scaled !== crop) scaled.recycle()
-                        if (crop !== work) crop.recycle()
-                        if (work !== bitmap) work.recycle()
-                        return it to "region"
-                    }
-                    if (scaled !== crop) scaled.recycle()
-                    if (crop !== work) crop.recycle()
-                } catch (_: Exception) {
-                }
+        // 2) Upscale full if small
+        if (bitmap.width < 800 || bitmap.height < 800) {
+            val f = 800f / minOf(bitmap.width, bitmap.height)
+            val up = Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * f).toInt(),
+                (bitmap.height * f).toInt(),
+                true
+            )
+            tryBitmap(up)?.let {
+                if (up !== bitmap) up.recycle()
+                return it to "up-full"
             }
+            if (up !== bitmap) up.recycle()
         }
 
-        // 3) Whole image mild upscale once
-        try {
-            val up = scaleIfNeeded(work, 400)
-            if (up !== work) {
-                tryBitmapRegion(up)?.let {
+        // 3) Center crops + optional upscale
+        for (ratio in floatArrayOf(0.5f, 0.4f, 0.6f, 0.3f, 0.7f, 0.25f)) {
+            val w = bitmap.width
+            val h = bitmap.height
+            val cw = (w * ratio).toInt().coerceAtLeast(32)
+            val ch = (h * ratio).toInt().coerceAtLeast(32)
+            val left = ((w - cw) / 2).coerceAtLeast(0)
+            val top = ((h - ch) / 2).coerceAtLeast(0)
+            val rw = minOf(cw, w - left)
+            val rh = minOf(ch, h - top)
+            if (rw < 24 || rh < 24) continue
+
+            val crop = try {
+                Bitmap.createBitmap(bitmap, left, top, rw, rh)
+            } catch (_: Exception) {
+                continue
+            }
+
+            tryBitmap(crop)?.let {
+                if (crop !== bitmap) crop.recycle()
+                return it to "crop"
+            }
+
+            // Upscale small crops so modules have enough pixels
+            for (scale in floatArrayOf(2f, 3f, 4f, 5f)) {
+                val tw = (rw * scale).toInt()
+                val th = (rh * scale).toInt()
+                if (tw > 2000 || th > 2000) continue
+                val up = try {
+                    Bitmap.createScaledBitmap(crop, tw, th, true)
+                } catch (_: Exception) {
+                    continue
+                }
+                tryBitmap(up)?.let {
                     up.recycle()
-                    if (work !== bitmap) work.recycle()
-                    return it to "up"
+                    if (crop !== bitmap) crop.recycle()
+                    return it to "crop-up"
                 }
                 up.recycle()
             }
-        } catch (_: Exception) {
+            if (crop !== bitmap) crop.recycle()
         }
 
-        if (work !== bitmap) work.recycle()
+        Log.d("TinyQR", "Gallery decode failed")
         return null
     }
 }
