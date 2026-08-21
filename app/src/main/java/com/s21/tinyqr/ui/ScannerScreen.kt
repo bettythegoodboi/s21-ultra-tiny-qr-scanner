@@ -39,12 +39,10 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -79,6 +77,11 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+
+enum class AppMode {
+    CAMERA,
+    IMAGE_INSPECTOR
+}
 
 data class CamOption(
     val label: String,
@@ -159,6 +162,9 @@ fun ScannerScreen() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
 
+    var currentMode by remember { mutableStateOf(AppMode.CAMERA) }
+    var pickedImageBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
     var lastResult by remember { mutableStateOf<DecodeResult?>(null) }
     var isScanning by remember { mutableStateOf(true) }
     var zoomRatio by remember { mutableStateOf(3.0f) }
@@ -179,11 +185,6 @@ fun ScannerScreen() {
     var tapPoint by remember { mutableStateOf<Offset?>(null) }
     val tapAnimProgress = remember { Animatable(1f) }
 
-    // Gallery / Image Selection & Manual Crop Dialog
-    var pickedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var showCropDialog by remember { mutableStateOf(false) }
-    var isGalleryProcessing by remember { mutableStateOf(false) }
-
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
     // Gallery Picker launcher
@@ -192,7 +193,6 @@ fun ScannerScreen() {
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
         coroutineScope.launch {
-            isGalleryProcessing = true
             statusText = "Loading picture..."
             val bmp = withContext(Dispatchers.IO) {
                 try {
@@ -206,65 +206,29 @@ fun ScannerScreen() {
             }
 
             if (bmp == null) {
-                isGalleryProcessing = false
-                Toast.makeText(context, "Could not load image", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Could not open image", Toast.LENGTH_SHORT).show()
                 return@launch
             }
 
-            pickedBitmap = bmp
-            statusText = "Scanning image for tiny codes..."
-
-            // Try auto-detection first
-            val autoResult = withContext(Dispatchers.Default) {
-                // 1. Unified Multi-Pass Decoder
-                QrDecoder.decode(bmp)
-            }
-
-            if (autoResult != null) {
-                isGalleryProcessing = false
-                lastResult = autoResult
-                isScanning = false
-                triggerHapticFeedback(context)
-                statusText = "Code Found: ${autoResult.formatName}"
-            } else {
-                // Fallback: ML Kit full scan
-                val mlOptions = BarcodeScannerOptions.Builder()
-                    .setBarcodeFormats(
-                        Barcode.FORMAT_DATA_MATRIX,
-                        Barcode.FORMAT_QR_CODE,
-                        Barcode.FORMAT_AZTEC,
-                        Barcode.FORMAT_PDF417
-                    )
-                    .build()
-                val ml = BarcodeScanning.getClient(mlOptions)
-                ml.process(InputImage.fromBitmap(bmp, 0))
-                    .addOnSuccessListener { codes ->
-                        isGalleryProcessing = false
-                        if (codes.isNotEmpty()) {
-                            val code = codes[0]
-                            val fmt = when (code.format) {
-                                Barcode.FORMAT_DATA_MATRIX -> "Data Matrix"
-                                Barcode.FORMAT_QR_CODE -> "QR Code"
-                                Barcode.FORMAT_AZTEC -> "Aztec"
-                                else -> "2D Barcode"
-                            }
-                            lastResult = DecodeResult(code.rawValue ?: "", fmt, "ML Kit")
-                            isScanning = false
-                            triggerHapticFeedback(context)
-                            statusText = "Code Found!"
-                        } else {
-                            // If auto-detection fails, prompt user with interactive crop tool
-                            statusText = "No code detected automatically. Adjust the crop box."
-                            showCropDialog = true
-                        }
-                    }
-                    .addOnFailureListener {
-                        isGalleryProcessing = false
-                        statusText = "Auto scan failed. Opening manual selector..."
-                        showCropDialog = true
-                    }
-            }
+            pickedImageBitmap = bmp
+            // Switch screen completely to Image Inspector Mode
+            currentMode = AppMode.IMAGE_INSPECTOR
         }
+    }
+
+    // IF in Picture Inspection Mode, render ImageInspectorScreen
+    if (currentMode == AppMode.IMAGE_INSPECTOR && pickedImageBitmap != null) {
+        ImageInspectorScreen(
+            bitmap = pickedImageBitmap!!,
+            onBackToCamera = {
+                currentMode = AppMode.CAMERA
+                isScanning = true
+            },
+            onNewImagePick = {
+                galleryLauncher.launch("image/*")
+            }
+        )
+        return
     }
 
     fun saveBitmap(bitmap: Bitmap) {
@@ -310,7 +274,7 @@ fun ScannerScreen() {
         } catch (_: Exception) {}
     }
 
-    // Dynamic manual focus adjustment (smooth without rebuilding camera session)
+    // Dynamic manual focus adjustment
     LaunchedEffect(focusDistance, manualFocusEnabled, camera) {
         val cam = camera ?: return@LaunchedEffect
         try {
@@ -389,7 +353,7 @@ fun ScannerScreen() {
             val analyzerExecutor = Executors.newSingleThreadExecutor()
 
             analysis.setAnalyzer(analyzerExecutor) { proxy ->
-                if (!isScanning) {
+                if (!isScanning || currentMode != AppMode.CAMERA) {
                     proxy.close()
                     return@setAnalyzer
                 }
@@ -537,7 +501,7 @@ fun ScannerScreen() {
             val canvasW = size.width
             val canvasH = size.height
 
-            // Center target box (50% size)
+            // Center target box (52% size)
             val boxSize = minOf(canvasW, canvasH) * 0.52f
             val boxLeft = (canvasW - boxSize) / 2f
             val boxTop = (canvasH - boxSize) / 2f
@@ -611,32 +575,6 @@ fun ScannerScreen() {
                 fontSize = 11.sp,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
-            )
-        }
-
-        // Interactive Image Manual Cropper (Dialog)
-        if (showCropDialog && pickedBitmap != null) {
-            ImageCropDialog(
-                bitmap = pickedBitmap!!,
-                onDismiss = { showCropDialog = false },
-                onDecodeSelection = { cropped ->
-                    showCropDialog = false
-                    coroutineScope.launch {
-                        statusText = "Decoding selected area..."
-                        val res = withContext(Dispatchers.Default) {
-                            QrDecoder.decode(cropped)
-                        }
-                        if (res != null) {
-                            lastResult = res
-                            isScanning = false
-                            triggerHapticFeedback(context)
-                            statusText = "Code Found in Selection!"
-                        } else {
-                            Toast.makeText(context, "No code found in selected box. Try zooming further.", Toast.LENGTH_LONG).show()
-                            showCropDialog = true
-                        }
-                    }
-                }
             )
         }
 
@@ -873,7 +811,7 @@ fun ScannerScreen() {
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Action Toolbar: Capture frame, Gallery Pick, Manual Select
+            // Action Toolbar: Capture frame, Select Picture
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -893,30 +831,16 @@ fun ScannerScreen() {
                     Text("Capture", fontSize = 13.sp)
                 }
 
-                // Choose from Gallery
+                // Choose from Gallery -> Switches full screen to ImageInspectorScreen
                 Button(
                     onClick = { galleryLauncher.launch("image/*") },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00838F)),
-                    modifier = Modifier.weight(1.2f),
+                    modifier = Modifier.weight(1.3f),
                     contentPadding = PaddingValues(vertical = 10.dp)
                 ) {
                     Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Select Image", fontSize = 13.sp)
-                }
-
-                // Manual Crop / Zoom (if image is already picked)
-                if (pickedBitmap != null) {
-                    Button(
-                        onClick = { showCropDialog = true },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
-                        modifier = Modifier.weight(1.1f),
-                        contentPadding = PaddingValues(vertical = 10.dp)
-                    ) {
-                        Icon(imageVector = Icons.Default.Crop, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Crop/Zoom", fontSize = 13.sp)
-                    }
+                    Text("Select Picture", fontSize = 13.sp)
                 }
             }
         }
