@@ -2,6 +2,7 @@ package com.s21.tinyqr
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -38,12 +39,13 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
         if (!hasCameraPermission) {
-            requestPermissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.CAMERA,
-                    Manifest.permission.READ_MEDIA_IMAGES
-                )
-            )
+            val perms = mutableListOf(Manifest.permission.CAMERA)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                perms.add(Manifest.permission.READ_MEDIA_IMAGES)
+            } else {
+                perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+            requestPermissionLauncher.launch(perms.toTypedArray())
         }
 
         setContent {
@@ -55,7 +57,7 @@ class MainActivity : ComponentActivity() {
                     if (hasCameraPermission) {
                         ScannerScreen()
                     } else {
-                        Text("Camera permission is required")
+                        Text("Camera permission is required to scan codes.")
                     }
                 }
             }
