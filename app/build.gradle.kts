@@ -12,8 +12,8 @@ android {
         applicationId = "com.samsung.android.scan3d"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.4.0"
     }
 
     buildTypes {
@@ -51,6 +51,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
 
     val cameraxVersion = "1.4.0"
     implementation("androidx.camera:camera-core:$cameraxVersion")
@@ -58,10 +59,10 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
-    // ML Kit
+    // ML Kit Barcode Scanning
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
-    // ZXing - often better for tiny / damaged QR
+    // ZXing for tiny / damaged / DPM QR and Data Matrix
     implementation("com.google.zxing:core:3.5.3")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
