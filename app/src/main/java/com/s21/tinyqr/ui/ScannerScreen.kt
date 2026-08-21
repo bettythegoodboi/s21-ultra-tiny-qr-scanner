@@ -1,6 +1,10 @@
 package com.s21.tinyqr.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
@@ -11,34 +15,49 @@ import android.hardware.camera2.CaptureRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.MediaStore
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import androidx.camera.core.Camera
-import androidx.camera.core.CameraInfo
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.FocusMeteringAction
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
-import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -51,6 +70,9 @@ import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -88,7 +110,7 @@ fun ImageProxy.toYPlane(): Pair<ByteArray, Pair<Int, Int>>? {
         }
         data to (w to h)
     } catch (e: Exception) {
-        Log.e("TinyQR", "Y plane failed", e)
+        Log.e("TinyQR", "Y plane extract failed", e)
         null
     }
 }
@@ -110,9 +132,24 @@ fun ImageProxy.toBitmapSafe(): Bitmap? {
         yuvImage.compressToJpeg(Rect(0, 0, width, height), 100, out)
         val bytes = out.toByteArray()
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         null
     }
+}
+
+fun triggerHapticFeedback(context: Context) {
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            vibratorManager?.defaultVibrator?.vibrate(
+                VibrationEffect.createOneShot(70, VibrationEffect.DEFAULT_AMPLITUDE)
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            vibrator?.vibrate(70)
+        }
+    } catch (_: Exception) {}
 }
 
 @OptIn(ExperimentalCamera2Interop::class)
@@ -120,12 +157,13 @@ fun ImageProxy.toBitmapSafe(): Bitmap? {
 fun ScannerScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
 
-    var lastResult by remember { mutableStateOf<String?>(null) }
+    var lastResult by remember { mutableStateOf<DecodeResult?>(null) }
     var isScanning by remember { mutableStateOf(true) }
-    var zoomRatio by remember { mutableStateOf(4.0f) }
+    var zoomRatio by remember { mutableStateOf(3.0f) }
     var torchOn by remember { mutableStateOf(false) }
-    var statusText by remember { mutableStateOf("Loading...") }
+    var statusText by remember { mutableStateOf("Ready to scan") }
     var availableCams by remember { mutableStateOf<List<CamOption>>(emptyList()) }
     var selectedCamIndex by remember { mutableStateOf(0) }
     var camera by remember { mutableStateOf<Camera?>(null) }
@@ -134,57 +172,104 @@ fun ScannerScreen() {
     var lastFrameBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     var manualFocusEnabled by remember { mutableStateOf(true) }
-    var focusDistance by remember { mutableStateOf(0f) }
-    var maxFocusDistance by remember { mutableStateOf(10f) }
+    var focusDistance by remember { mutableStateOf(10f) }
+    var maxFocusDistance by remember { mutableStateOf(20f) }
+
+    // Tap-to-focus animation state
+    var tapPoint by remember { mutableStateOf<Offset?>(null) }
+    val tapAnimProgress = remember { Animatable(1f) }
+
+    // Gallery / Image Selection & Manual Crop Dialog
+    var pickedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var showCropDialog by remember { mutableStateOf(false) }
+    var isGalleryProcessing by remember { mutableStateOf(false) }
 
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
+    // Gallery Picker launcher
     val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        try {
-            val stream = context.contentResolver.openInputStream(uri)
-            val bitmap = BitmapFactory.decodeStream(stream)
-            stream?.close()
-            if (bitmap == null) {
-                statusText = "Cannot open image"
-                return@rememberLauncherForActivityResult
-            }
-            statusText = "Decoding..."
-            val zx = QrDecoder.decode(bitmap)
-            if (zx != null) {
-                lastResult = zx.first
-                isScanning = false
-                statusText = "Found!"
-                return@rememberLauncherForActivityResult
-            }
-            val options = BarcodeScannerOptions.Builder()
-                .setBarcodeFormats(
-                    Barcode.FORMAT_DATA_MATRIX,
-                    Barcode.FORMAT_QR_CODE,
-                    Barcode.FORMAT_AZTEC,
-                    Barcode.FORMAT_PDF417
-                )
-                .build()
-            BarcodeScanning.getClient(options)
-                .process(InputImage.fromBitmap(bitmap, 0))
-                .addOnSuccessListener { list ->
-                    if (list.isNotEmpty()) {
-                        lastResult = list[0].rawValue
-                        isScanning = false
-                        statusText = "Found!"
-                    } else statusText = "No code found"
+        coroutineScope.launch {
+            isGalleryProcessing = true
+            statusText = "Loading picture..."
+            val bmp = withContext(Dispatchers.IO) {
+                try {
+                    val stream = context.contentResolver.openInputStream(uri)
+                    val decoded = BitmapFactory.decodeStream(stream)
+                    stream?.close()
+                    decoded
+                } catch (_: Exception) {
+                    null
                 }
-                .addOnFailureListener { statusText = "Decode error" }
-        } catch (e: Exception) {
-            statusText = "Image error"
+            }
+
+            if (bmp == null) {
+                isGalleryProcessing = false
+                Toast.makeText(context, "Could not load image", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+
+            pickedBitmap = bmp
+            statusText = "Scanning image for tiny codes..."
+
+            // Try auto-detection first
+            val autoResult = withContext(Dispatchers.Default) {
+                // 1. Unified Multi-Pass Decoder
+                QrDecoder.decode(bmp)
+            }
+
+            if (autoResult != null) {
+                isGalleryProcessing = false
+                lastResult = autoResult
+                isScanning = false
+                triggerHapticFeedback(context)
+                statusText = "Code Found: ${autoResult.formatName}"
+            } else {
+                // Fallback: ML Kit full scan
+                val mlOptions = BarcodeScannerOptions.Builder()
+                    .setBarcodeFormats(
+                        Barcode.FORMAT_DATA_MATRIX,
+                        Barcode.FORMAT_QR_CODE,
+                        Barcode.FORMAT_AZTEC,
+                        Barcode.FORMAT_PDF417
+                    )
+                    .build()
+                val ml = BarcodeScanning.getClient(mlOptions)
+                ml.process(InputImage.fromBitmap(bmp, 0))
+                    .addOnSuccessListener { codes ->
+                        isGalleryProcessing = false
+                        if (codes.isNotEmpty()) {
+                            val code = codes[0]
+                            val fmt = when (code.format) {
+                                Barcode.FORMAT_DATA_MATRIX -> "Data Matrix"
+                                Barcode.FORMAT_QR_CODE -> "QR Code"
+                                Barcode.FORMAT_AZTEC -> "Aztec"
+                                else -> "2D Barcode"
+                            }
+                            lastResult = DecodeResult(code.rawValue ?: "", fmt, "ML Kit")
+                            isScanning = false
+                            triggerHapticFeedback(context)
+                            statusText = "Code Found!"
+                        } else {
+                            // If auto-detection fails, prompt user with interactive crop tool
+                            statusText = "No code detected automatically. Adjust the crop box."
+                            showCropDialog = true
+                        }
+                    }
+                    .addOnFailureListener {
+                        isGalleryProcessing = false
+                        statusText = "Auto scan failed. Opening manual selector..."
+                        showCropDialog = true
+                    }
+            }
         }
     }
 
     fun saveBitmap(bitmap: Bitmap) {
         try {
-            val name = "DM_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
+            val name = "TinyQR_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, name)
                 put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -197,32 +282,66 @@ fun ScannerScreen() {
                 context.contentResolver.openOutputStream(uri)?.use {
                     bitmap.compress(Bitmap.CompressFormat.JPEG, 100, it)
                 }
-                Toast.makeText(context, "Saved $name", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Saved frame to Gallery", Toast.LENGTH_SHORT).show()
             }
         } catch (_: Exception) {
             Toast.makeText(context, "Save failed", Toast.LENGTH_SHORT).show()
         }
     }
 
+    // Dynamic zoom adjustment
     LaunchedEffect(zoomRatio, camera) {
         try {
             camera?.let {
                 val zs = it.cameraInfo.zoomState.value ?: return@let
                 it.cameraControl.setZoomRatio(zoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
             }
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) {}
     }
 
+    // Torch control
     LaunchedEffect(torchOn, camera) {
         try {
             if (camera?.cameraInfo?.hasFlashUnit() == true) {
                 camera?.cameraControl?.enableTorch(torchOn)
-            } else torchOn = false
-        } catch (_: Exception) {
+            } else {
+                torchOn = false
+            }
+        } catch (_: Exception) {}
+    }
+
+    // Dynamic manual focus adjustment (smooth without rebuilding camera session)
+    LaunchedEffect(focusDistance, manualFocusEnabled, camera) {
+        val cam = camera ?: return@LaunchedEffect
+        try {
+            val camera2Control = Camera2CameraControl.from(cam.cameraControl)
+            if (manualFocusEnabled) {
+                val options = CaptureRequestOptions.Builder()
+                    .setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_OFF
+                    )
+                    .setCaptureRequestOption(
+                        CaptureRequest.LENS_FOCUS_DISTANCE,
+                        focusDistance
+                    )
+                    .build()
+                camera2Control.setCaptureRequestOptions(options)
+            } else {
+                val options = CaptureRequestOptions.Builder()
+                    .setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                    )
+                    .build()
+                camera2Control.setCaptureRequestOptions(options)
+            }
+        } catch (e: Exception) {
+            Log.e("TinyQR", "Failed to update focus distance", e)
         }
     }
 
+    // Bind camera session
     fun bindCamera() {
         val provider = providerRef ?: return
         val previewView = previewViewRef ?: return
@@ -267,35 +386,46 @@ fun ScannerScreen() {
                 .build()
             val ml = BarcodeScanning.getClient(mlOptions)
 
-            analysis.setAnalyzer(Executors.newSingleThreadExecutor()) { proxy ->
+            val analyzerExecutor = Executors.newSingleThreadExecutor()
+
+            analysis.setAnalyzer(analyzerExecutor) { proxy ->
                 if (!isScanning) {
                     proxy.close()
                     return@setAnalyzer
                 }
                 try {
+                    // Stage 1: Ultra-fast raw YUV decode with multi-pass (ZXing + Custom DPM)
                     val yPair = proxy.toYPlane()
                     if (yPair != null) {
                         val (yData, size) = yPair
-                        val text = QrDecoder.decodeYuv(yData, size.first, size.second)
-                        if (text != null) {
-                            lastResult = text
+                        val res = QrDecoder.decodeYuv(yData, size.first, size.second, cropPercent = 0.50f)
+                        if (res != null) {
+                            lastResult = res
                             isScanning = false
-                            statusText = "Found!"
+                            triggerHapticFeedback(context)
                             proxy.toBitmapSafe()?.let { lastFrameBitmap = it }
                             proxy.close()
                             return@setAnalyzer
                         }
                     }
 
+                    // Stage 2: ML Kit Barcode analysis
                     val media = proxy.image
                     if (media != null) {
                         val image = InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees)
                         ml.process(image)
                             .addOnSuccessListener { codes ->
-                                if (codes.isNotEmpty()) {
-                                    lastResult = codes[0].rawValue
+                                if (codes.isNotEmpty() && isScanning) {
+                                    val code = codes[0]
+                                    val fmt = when (code.format) {
+                                        Barcode.FORMAT_DATA_MATRIX -> "Data Matrix"
+                                        Barcode.FORMAT_QR_CODE -> "QR Code"
+                                        Barcode.FORMAT_AZTEC -> "Aztec"
+                                        else -> "2D Barcode"
+                                    }
+                                    lastResult = DecodeResult(code.rawValue ?: "", fmt, "ML Kit")
                                     isScanning = false
-                                    statusText = "Found!"
+                                    triggerHapticFeedback(context)
                                 }
                             }
                             .addOnCompleteListener {
@@ -306,40 +436,55 @@ fun ScannerScreen() {
                         proxy.close()
                     }
                 } catch (e: Exception) {
-                    Log.e("TinyQR", "analyze", e)
+                    Log.e("TinyQR", "Analyzer exception", e)
                     proxy.close()
                 }
             }
 
             val cam = provider.bindToLifecycle(lifecycleOwner, selector, preview, analysis)
             camera = cam
-            maxFocusDistance = if (option.minFocusDistance > 0f) option.minFocusDistance else 10f
+            maxFocusDistance = if (option.minFocusDistance > 0f) option.minFocusDistance else 20f
+            if (focusDistance > maxFocusDistance) focusDistance = maxFocusDistance
 
-            if (!manualFocusEnabled) {
-                try {
-                    val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
-                    val action = FocusMeteringAction.Builder(
-                        factory.createPoint(0.5f, 0.5f),
-                        FocusMeteringAction.FLAG_AF
-                    ).setAutoCancelDuration(2, TimeUnit.SECONDS).build()
-                    cam.cameraControl.startFocusAndMetering(action)
-                } catch (_: Exception) {
-                }
-            }
-
-            statusText = "${option.label} | Data Matrix"
+            statusText = "${option.label} | Targeting tiny codes"
             torchOn = false
         } catch (e: Exception) {
-            Log.e("TinyQR", "bind", e)
-            statusText = "Camera error"
+            Log.e("TinyQR", "Bind failed", e)
+            statusText = "Camera init error"
         }
     }
 
-    LaunchedEffect(selectedCamIndex, availableCams, manualFocusEnabled, focusDistance) {
+    // Trigger binding on camera selection change
+    LaunchedEffect(selectedCamIndex, availableCams) {
         if (availableCams.isNotEmpty()) bindCamera()
     }
 
+    // Tap-to-focus handler
+    fun handleTapToFocus(offset: Offset, viewWidth: Float, viewHeight: Float) {
+        val cam = camera ?: return
+        if (viewWidth <= 0f || viewHeight <= 0f) return
+
+        tapPoint = offset
+        coroutineScope.launch {
+            tapAnimProgress.snapTo(0f)
+            tapAnimProgress.animateTo(1f, animationSpec = tween(600))
+            tapPoint = null
+        }
+
+        try {
+            val factory = SurfaceOrientedMeteringPointFactory(viewWidth, viewHeight)
+            val point = factory.createPoint(offset.x, offset.y)
+            val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                .build()
+            cam.cameraControl.startFocusAndMetering(action)
+        } catch (e: Exception) {
+            Log.e("TinyQR", "Tap to focus failed", e)
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
+        // Camera Preview + Tap Gestures
         AndroidView(
             factory = { ctx ->
                 val pv = PreviewView(ctx)
@@ -361,47 +506,107 @@ fun ScannerScreen() {
                                     CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE
                                 ) ?: 0f
                                 val label = when {
-                                    focal < 2.5f -> "Ultrawide"
+                                    focal < 2.5f -> "Ultrawide (Macro)"
                                     focal < 7f -> "Main"
                                     focal < 20f -> "3x Tele"
                                     else -> "10x Tele"
                                 }
                                 cams.add(CamOption(label, info, focal, info.hasFlashUnit(), minF))
-                            } catch (_: Exception) {
-                            }
+                            } catch (_: Exception) {}
                         }
                         availableCams = cams.sortedBy { it.focalLength }
-                        val uw = availableCams.indexOfFirst { it.label == "Ultrawide" }
+                        val uw = availableCams.indexOfFirst { it.label.contains("Ultrawide") }
                         selectedCamIndex = if (uw >= 0) uw else 0
-                        statusText = "${availableCams.size} cams | Data Matrix"
                     } catch (_: Exception) {
-                        statusText = "Init failed"
+                        statusText = "Camera detection failed"
                     }
                 }, ContextCompat.getMainExecutor(ctx))
                 pv
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTapGestures { tapOffset ->
+                        handleTapToFocus(tapOffset, size.width.toFloat(), size.height.toFloat())
+                    }
+                }
         )
 
-        // Top status - pad for status bar
+        // Targeting Reticle & Viewfinder Frame
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val canvasW = size.width
+            val canvasH = size.height
+
+            // Center target box (50% size)
+            val boxSize = minOf(canvasW, canvasH) * 0.52f
+            val boxLeft = (canvasW - boxSize) / 2f
+            val boxTop = (canvasH - boxSize) / 2f
+
+            // Frame border
+            drawRect(
+                color = if (isScanning) Color(0xFF00E676) else Color.Yellow,
+                topLeft = Offset(boxLeft, boxTop),
+                size = Size(boxSize, boxSize),
+                style = Stroke(width = 2.dp.toPx())
+            )
+
+            // High-precision corner brackets
+            val cornerLen = 24.dp.toPx()
+            val strokeW = 4.dp.toPx()
+            val cornerColor = Color.White
+
+            // Top-left
+            drawLine(cornerColor, Offset(boxLeft, boxTop), Offset(boxLeft + cornerLen, boxTop), strokeW)
+            drawLine(cornerColor, Offset(boxLeft, boxTop), Offset(boxLeft, boxTop + cornerLen), strokeW)
+            // Top-right
+            drawLine(cornerColor, Offset(boxLeft + boxSize, boxTop), Offset(boxLeft + boxSize - cornerLen, boxTop), strokeW)
+            drawLine(cornerColor, Offset(boxLeft + boxSize, boxTop), Offset(boxLeft + boxSize, boxTop + cornerLen), strokeW)
+            // Bottom-left
+            drawLine(cornerColor, Offset(boxLeft, boxTop + boxSize), Offset(boxLeft + cornerLen, boxTop + boxSize), strokeW)
+            drawLine(cornerColor, Offset(boxLeft, boxTop + boxSize), Offset(boxLeft, boxTop + boxSize - cornerLen), strokeW)
+            // Bottom-right
+            drawLine(cornerColor, Offset(boxLeft + boxSize, boxTop + boxSize), Offset(boxLeft + boxSize - cornerLen, boxTop + boxSize), strokeW)
+            drawLine(cornerColor, Offset(boxLeft + boxSize, boxTop + boxSize), Offset(boxLeft + boxSize, boxTop + boxSize - cornerLen), strokeW)
+
+            // Center Crosshair
+            val midX = canvasW / 2f
+            val midY = canvasH / 2f
+            val crosshairLen = 12.dp.toPx()
+            drawLine(Color.Cyan.copy(alpha = 0.8f), Offset(midX - crosshairLen, midY), Offset(midX + crosshairLen, midY), 2.dp.toPx())
+            drawLine(Color.Cyan.copy(alpha = 0.8f), Offset(midX, midY - crosshairLen), Offset(midX, midY + crosshairLen), 2.dp.toPx())
+
+            // Tap to focus animated ring
+            tapPoint?.let { tp ->
+                val radius = (40.dp.toPx()) * (1f - tapAnimProgress.value * 0.3f)
+                val alpha = 1f - tapAnimProgress.value
+                drawCircle(
+                    color = Color.Yellow.copy(alpha = alpha),
+                    radius = radius,
+                    center = tp,
+                    style = Stroke(width = 2.dp.toPx())
+                )
+            }
+        }
+
+        // Top Status Header
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
                 .background(Color.Black.copy(alpha = 0.75f))
-                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .padding(horizontal = 14.dp, vertical = 10.dp)
         ) {
             Text(
-                text = if (isScanning) statusText else "CODE FOUND",
-                color = Color.White,
+                text = if (isScanning) statusText else "SCAN COMPLETE",
+                color = if (isScanning) Color.White else Color(0xFF00E676),
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "Raw Y → DataMatrixReader",
+                text = "Aim at tiny Data Matrix / QR code (< 5mm)",
                 color = Color.Cyan,
                 fontSize = 11.sp,
                 textAlign = TextAlign.Center,
@@ -409,37 +614,176 @@ fun ScannerScreen() {
             )
         }
 
-        // Bottom panel - pad for nav bar so buttons are clickable
+        // Interactive Image Manual Cropper (Dialog)
+        if (showCropDialog && pickedBitmap != null) {
+            ImageCropDialog(
+                bitmap = pickedBitmap!!,
+                onDismiss = { showCropDialog = false },
+                onDecodeSelection = { cropped ->
+                    showCropDialog = false
+                    coroutineScope.launch {
+                        statusText = "Decoding selected area..."
+                        val res = withContext(Dispatchers.Default) {
+                            QrDecoder.decode(cropped)
+                        }
+                        if (res != null) {
+                            lastResult = res
+                            isScanning = false
+                            triggerHapticFeedback(context)
+                            statusText = "Code Found in Selection!"
+                        } else {
+                            Toast.makeText(context, "No code found in selected box. Try zooming further.", Toast.LENGTH_LONG).show()
+                            showCropDialog = true
+                        }
+                    }
+                }
+            )
+        }
+
+        // Bottom Controls Panel
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
-                .background(Color.Black.copy(alpha = 0.92f))
-                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .background(Color.Black.copy(alpha = 0.90f))
+                .padding(horizontal = 12.dp, vertical = 10.dp)
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (lastResult != null) {
-                Text("Result:", color = Color.White, fontSize = 12.sp)
-                Text(
-                    text = lastResult ?: "",
-                    color = Color.Green,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(4.dp)
-                )
-                Button(
-                    onClick = {
-                        lastResult = null
-                        isScanning = true
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("Scan Again") }
-                Spacer(modifier = Modifier.height(6.dp))
+            // Result Bottom Sheet View
+            AnimatedVisibility(
+                visible = lastResult != null,
+                enter = fadeIn(),
+                exit = fadeOut()
+            ) {
+                lastResult?.let { result ->
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    color = Color(0xFF00E676),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = result.formatName,
+                                        color = Color.Black,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
+                                if (result.details.isNotEmpty()) {
+                                    Text(result.details, color = Color.Gray, fontSize = 11.sp)
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Text(
+                                text = result.text,
+                                color = Color.White,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            // Action buttons: Copy, Open Browser, Share, Scan Again
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                // Copy
+                                Button(
+                                    onClick = {
+                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        clipboard.setPrimaryClip(ClipData.newPlainText("TinyQR", result.text))
+                                        Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
+                                    modifier = Modifier.weight(1f),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.ContentCopy, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Copy", fontSize = 12.sp)
+                                }
+
+                                // Open Browser if URL
+                                if (result.text.startsWith("http://") || result.text.startsWith("https://") || result.text.startsWith("www.")) {
+                                    Button(
+                                        onClick = {
+                                            val url = if (!result.text.startsWith("http://") && !result.text.startsWith("https://")) {
+                                                "https://${result.text}"
+                                            } else result.text
+                                            try {
+                                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                                context.startActivity(intent)
+                                            } catch (_: Exception) {
+                                                Toast.makeText(context, "Cannot open URL", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0091EA)),
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.OpenInBrowser, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Open", fontSize = 12.sp)
+                                    }
+                                }
+
+                                // Share
+                                Button(
+                                    onClick = {
+                                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                            type = "text/plain"
+                                            putExtra(Intent.EXTRA_TEXT, result.text)
+                                        }
+                                        context.startActivity(Intent.createChooser(shareIntent, "Share Scanned Code"))
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
+                                    modifier = Modifier.weight(1f),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Share, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Share", fontSize = 12.sp)
+                                }
+
+                                // Scan Again
+                                Button(
+                                    onClick = {
+                                        lastResult = null
+                                        isScanning = true
+                                        statusText = "Aim at code..."
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676)),
+                                    modifier = Modifier.weight(1.2f),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Refresh, contentDescription = null, tint = Color.Black, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Scan", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
+            // Camera selector chips
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -450,24 +794,34 @@ fun ScannerScreen() {
                     Button(
                         onClick = { selectedCamIndex = i },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (selectedCamIndex == i) Color(0xFF2196F3) else Color.DarkGray
+                            containerColor = if (selectedCamIndex == i) Color(0xFF2196F3) else Color(0xFF2B2B2B)
                         ),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) { Text(cam.label, fontSize = 12.sp) }
+                    ) {
+                        Text(cam.label, fontSize = 12.sp, color = Color.White)
+                    }
                 }
             }
 
             Spacer(modifier = Modifier.height(4.dp))
 
+            // Focus & Macro controls
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("Manual Focus", color = Color.White, fontSize = 13.sp)
-                Spacer(modifier = Modifier.width(8.dp))
-                Switch(checked = manualFocusEnabled, onCheckedChange = { manualFocusEnabled = it })
+                Text("Close Macro Focus", color = Color.White, fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (manualFocusEnabled) "Manual (${String.format(Locale.US, "%.1f", focusDistance)} D)" else "Auto", color = Color.LightGray, fontSize = 11.sp)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Switch(
+                        checked = manualFocusEnabled,
+                        onCheckedChange = { manualFocusEnabled = it }
+                    )
+                }
             }
+
             if (manualFocusEnabled) {
                 Slider(
                     value = focusDistance,
@@ -477,64 +831,94 @@ fun ScannerScreen() {
                 )
             }
 
-            Text("Zoom ${String.format("%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
+            // Zoom & Torch Controls
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(
-                    onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
-                ) { Text("- Zoom") }
-                Button(
-                    onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
-                ) { Text("+ Zoom") }
-                val flash = availableCams.getOrNull(selectedCamIndex)?.hasFlash == true
-                Button(
-                    onClick = { if (flash) torchOn = !torchOn },
-                    enabled = flash,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (torchOn) Color(0xFFFFC107) else Color.DarkGray
-                    ),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
-                ) { Text(if (torchOn) "Torch ON" else "Torch") }
+                Text("Zoom ${String.format(Locale.US, "%.1fx", zoomRatio)}", color = Color.White, fontSize = 12.sp)
+
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = { zoomRatio = (zoomRatio - 0.5f).coerceAtLeast(1f) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) { Text("-", fontSize = 14.sp) }
+
+                    Button(
+                        onClick = { zoomRatio = (zoomRatio + 0.5f).coerceAtMost(15f) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) { Text("+", fontSize = 14.sp) }
+
+                    val flash = availableCams.getOrNull(selectedCamIndex)?.hasFlash == true
+                    Button(
+                        onClick = { if (flash) torchOn = !torchOn },
+                        enabled = flash,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (torchOn) Color(0xFFFFC107) else Color(0xFF333333)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (torchOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                            contentDescription = "Torch",
+                            tint = if (torchOn) Color.Black else Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
+            // Action Toolbar: Capture frame, Gallery Pick, Manual Select
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                // Capture current frame
                 Button(
                     onClick = {
                         lastFrameBitmap?.let { saveBitmap(it) }
-                            ?: Toast.makeText(context, "No frame", Toast.LENGTH_SHORT).show()
+                            ?: Toast.makeText(context, "No frame available", Toast.LENGTH_SHORT).show()
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF9C27B0)),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-                ) { Text("Capture") }
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7B1FA2)),
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(vertical = 10.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Capture", fontSize = 13.sp)
+                }
 
+                // Choose from Gallery
                 Button(
                     onClick = { galleryLauncher.launch("image/*") },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00BCD4)),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-                ) { Text("Gallery") }
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00838F)),
+                    modifier = Modifier.weight(1.2f),
+                    contentPadding = PaddingValues(vertical = 10.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Select Image", fontSize = 13.sp)
+                }
 
-                Button(
-                    onClick = {
-                        isScanning = true
-                        lastResult = null
-                        statusText = "Scanning..."
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
-                ) { Text("Scan") }
+                // Manual Crop / Zoom (if image is already picked)
+                if (pickedBitmap != null) {
+                    Button(
+                        onClick = { showCropDialog = true },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
+                        modifier = Modifier.weight(1.1f),
+                        contentPadding = PaddingValues(vertical = 10.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Crop, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Crop/Zoom", fontSize = 13.sp)
+                    }
+                }
             }
-
-            // Extra space so last row is fully above nav gestures
-            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 }
