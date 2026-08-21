@@ -11,22 +11,20 @@ import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.datamatrix.DataMatrixReader
 import java.util.EnumSet
 import java.util.Hashtable
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
-import kotlin.math.sqrt
 
 /**
- * Custom Data Matrix pipeline for small industrial marks.
+ * Custom Data Matrix pipeline for tiny industrial marks.
  *
- * Steps (fundamentals):
+ * Steps:
  * 1. Grayscale
- * 2. Local adaptive threshold (handles dark plastic + uneven light)
+ * 2. Local adaptive threshold (handles dark plastic / metal + uneven light)
  * 3. Find solid L-border candidates (Data Matrix finder)
  * 4. Sample module grid
  * 5. Reconstruct clean black/white image
- * 6. Decode short ECC200 content
+ * 6. Decode ECC200 content
  */
 object CustomDataMatrix {
 
@@ -45,7 +43,7 @@ object CustomDataMatrix {
             val binary = adaptiveThreshold(gray, w, h, window, 8)
             decodeBinary(binary, w, h)?.let { return it }
 
-            // Inverted (light mark on dark / dark mark on light)
+            // Inverted (light mark on dark)
             val inv = IntArray(binary.size) { if (binary[it] == 0) 255 else 0 }
             decodeBinary(inv, w, h)?.let { return it }
         }
@@ -70,7 +68,6 @@ object CustomDataMatrix {
     }
 
     private fun decodeBinary(binary: IntArray, w: Int, h: Int): String? {
-        // Scan for square-ish regions and try grid sampling
         val step = max(8, min(w, h) / 20)
         val sizes = intArrayOf(
             min(w, h) / 3,
@@ -105,7 +102,6 @@ object CustomDataMatrix {
         return null
     }
 
-    /** Rough L-border check: solid edges on two adjacent sides */
     private fun hasLBorder(bin: IntArray, w: Int, h: Int, x0: Int, y0: Int, sz: Int): Boolean {
         if (x0 + sz > w || y0 + sz > h) return false
         fun dark(x: Int, y: Int) = bin[y * w + x] < 128
@@ -121,7 +117,6 @@ object CustomDataMatrix {
             if (dark(x0 + i, y0)) top++
         }
         val thr = (sz * 0.65).toInt()
-        // Data Matrix has solid L on two adjacent sides
         val solidPairs = listOf(
             left >= thr && bottom >= thr,
             bottom >= thr && right >= thr,
@@ -141,9 +136,6 @@ object CustomDataMatrix {
         return null
     }
 
-    /**
-     * Sample a region into an N×N module grid, rebuild clean bitmap, decode.
-     */
     private fun sampleRegion(
         bin: IntArray, bw: Int, bh: Int,
         x0: Int, y0: Int, rw: Int, rh: Int,
@@ -160,7 +152,6 @@ object CustomDataMatrix {
             for (mx in 0 until modules) {
                 val cx = (x0 + (mx + 0.5f) * cellW).roundToInt().coerceIn(0, bw - 1)
                 val cy = (y0 + (my + 0.5f) * cellH).roundToInt().coerceIn(0, bh - 1)
-                // Majority vote in small neighborhood
                 var dark = 0
                 var total = 0
                 for (dy in -1..1) {
@@ -221,20 +212,17 @@ object CustomDataMatrix {
             val r = (p shr 16) and 0xff
             val g = (p shr 8) and 0xff
             val b = p and 0xff
-            // Luminance
             gray[i] = (0.299 * r + 0.587 * g + 0.114 * b).toInt()
         }
         return gray
     }
 
-    /** Local mean adaptive threshold */
     private fun adaptiveThreshold(
         gray: IntArray, w: Int, h: Int,
         window: Int, c: Int
     ): IntArray {
         val out = IntArray(w * h)
         val half = window / 2
-        // Integral image for fast mean
         val integral = LongArray((w + 1) * (h + 1))
         for (y in 0 until h) {
             var rowSum = 0L
@@ -247,9 +235,9 @@ object CustomDataMatrix {
         fun sum(x1: Int, y1: Int, x2: Int, y2: Int): Long {
             val a = integral[y1 * (w + 1) + x1]
             val b = integral[y1 * (w + 1) + x2]
-            val c = integral[y2 * (w + 1) + x1]
+            val cVal = integral[y2 * (w + 1) + x1]
             val d = integral[y2 * (w + 1) + x2]
-            return d - b - c + a
+            return d - b - cVal + a
         }
         for (y in 0 until h) {
             for (x in 0 until w) {
