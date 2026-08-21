@@ -6,16 +6,15 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Industrial DPM-style enhancement for soft / blurry Data Matrix on dark parts.
+ * Industrial DPM-style enhancement for soft / blurry Data Matrix and QR codes on dark parts / metal.
  *
- * Cognex-class readers succeed on soft marks by recovering module edges first.
  * Pipeline:
- *  1. Grayscale
- *  2. CLAHE-like local contrast (uneven lighting on curved plastic)
- *  3. Black-hat morphology (extract dark marks on varying background)
- *  4. Unsharp mask (deblur approximation)
+ *  1. Grayscale extraction
+ *  2. CLAHE-like local contrast (handles uneven lighting / metallic reflections)
+ *  3. Unsharp mask (deblur approximation)
+ *  4. Black-hat morphology (extracts dark dots/modules on light backgrounds)
  *  5. Laplacian edge boost
- *  6. Adaptive binarization
+ *  6. Multi-window adaptive binarization & Otsu
  */
 object DpmEnhance {
 
@@ -33,7 +32,7 @@ object DpmEnhance {
         val sharp = unsharp(clahe, radius = 2, amount = 2.5f, threshold = 0)
         results += toBitmap(sharp)
 
-        // C) Black-hat (dark modules on gray plastic)
+        // C) Black-hat (dark modules on gray metal / plastic)
         val bh = blackHat(clahe, k = 5)
         val bhSharp = unsharp(bh, radius = 1, amount = 2.0f, threshold = 0)
         results += toBitmap(bhSharp)
@@ -42,7 +41,7 @@ object DpmEnhance {
         val lap = addLaplacian(sharp, strength = 1.2f)
         results += toBitmap(lap)
 
-        // E) Adaptive binary versions (often best for decode)
+        // E) Adaptive binary versions
         for (win in intArrayOf(15, 25, 35)) {
             if (win < min(g0.w, g0.h)) {
                 results += toBitmap(adaptiveBinary(sharp, win, 5))
@@ -51,7 +50,7 @@ object DpmEnhance {
             }
         }
 
-        // F) Otsu on sharpened
+        // F) Otsu on sharpened & Laplacian
         results += toBitmap(otsu(sharp))
         results += toBitmap(invert(otsu(sharp)))
         results += toBitmap(otsu(lap))
@@ -120,12 +119,14 @@ object DpmEnhance {
                 val cdf = IntArray(256)
                 cdf[0] = hist[0]
                 for (i in 1..255) cdf[i] = cdf[i - 1] + hist[i]
-                val cdfMin = cdf.first { it > 0 }
+                val cdfMin = cdf.firstOrNull { it > 0 } ?: 0
                 for (y in ty until y2) {
                     for (x in tx until x2) {
                         val v = src.data[y * w + x]
-                        val mapped = ((cdf[v] - cdfMin).toDouble() / (count - cdfMin) * 255.0)
-                            .toInt().coerceIn(0, 255)
+                        val mapped = if (count > cdfMin) {
+                            ((cdf[v] - cdfMin).toDouble() / (count - cdfMin) * 255.0)
+                                .toInt().coerceIn(0, 255)
+                        } else v
                         out[y * w + x] = mapped
                     }
                 }
@@ -136,7 +137,7 @@ object DpmEnhance {
         return GrayImage(out, w, h)
     }
 
-    /** Unsharp mask ≈ deblur for mild Gaussian blur */
+    /** Unsharp mask deblur */
     fun unsharp(src: GrayImage, radius: Int, amount: Float, threshold: Int): GrayImage {
         val blur = boxBlur(src, radius)
         val out = IntArray(src.data.size)
@@ -187,12 +188,11 @@ object DpmEnhance {
         return GrayImage(out, w, h)
     }
 
-    /** Morphological black-hat: original - opening ≈ dark features */
+    /** Morphological black-hat: original - opening */
     fun blackHat(src: GrayImage, k: Int): GrayImage {
         val opened = dilate(erode(src, k), k)
         val out = IntArray(src.data.size)
         for (i in src.data.indices) {
-            // For dark marks: boost difference
             val v = (opened.data[i] - src.data[i] + 128).coerceIn(0, 255)
             out[i] = v
         }
@@ -245,7 +245,6 @@ object DpmEnhance {
         val w = src.w
         val h = src.h
         val out = IntArray(w * h)
-        // Laplacian kernel: 0 -1 0 / -1 4 -1 / 0 -1 0
         for (y in 1 until h - 1) {
             for (x in 1 until w - 1) {
                 val c = src.data[y * w + x]
@@ -257,7 +256,6 @@ object DpmEnhance {
                 out[y * w + x] = (c + strength * lap).toInt().coerceIn(0, 255)
             }
         }
-        // borders copy
         for (x in 0 until w) {
             out[x] = src.data[x]
             out[(h - 1) * w + x] = src.data[(h - 1) * w + x]
