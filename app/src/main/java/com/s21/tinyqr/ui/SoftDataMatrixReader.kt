@@ -17,22 +17,12 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Fundamental soft/blurry Data Matrix reader.
- *
- * Why Cognex works on soft marks:
- * 1. Deblur / edge recovery
- * 2. Soft module sampling (not hard pixels)
- * 3. Search grid size + sub-pixel phase
- * 4. Score L-border + timing pattern
- * 5. Rebuild clean symbol → decode (ECC recovers residual errors)
- *
- * ECC200 square sizes: 10,12,14,...,26,32,...
+ * Soft / blurry Data Matrix reader using edge recovery and soft module grid sampling.
  */
 object SoftDataMatrixReader {
 
     private const val TAG = "SoftDM"
 
-    // Valid ECC200 square module counts
     private val DM_SIZES = intArrayOf(10, 12, 14, 16, 18, 20, 22, 24, 26, 32, 36, 40)
 
     fun decode(bitmap: Bitmap): String? {
@@ -42,7 +32,6 @@ object SoftDataMatrixReader {
 
         val gray = toGrayFloat(bitmap)
 
-        // Candidate images: original + deblurred + sharpened
         val candidates = mutableListOf(
             gray,
             richardsonLucyApprox(gray, w, h, iterations = 6),
@@ -53,7 +42,6 @@ object SoftDataMatrixReader {
         var bestText: String? = null
         var bestScore = -1.0
 
-        // Full frame + center crops
         val regions = mutableListOf(intArrayOf(0, 0, w, h))
         for (ratio in floatArrayOf(0.55f, 0.45f, 0.65f, 0.35f)) {
             val cw = (w * ratio).toInt().coerceAtLeast(32)
@@ -74,7 +62,7 @@ object SoftDataMatrixReader {
                     for (phase in floatArrayOf(0.35f, 0.45f, 0.5f, 0.55f, 0.65f)) {
                         val grid = softSample(roi, rw, rh, n, phase)
                         val score = scoreDataMatrixGrid(grid, n)
-                        if (score < 1.2) continue // weak L/timing
+                        if (score < 1.2) continue
 
                         val clean = gridToBitmap(grid, n, modulePx = 10)
                         val text = decodePure(clean)
@@ -118,15 +106,13 @@ object SoftDataMatrixReader {
         return out
     }
 
-    /** Approximate Richardson–Lucy with Gaussian PSF (deblur soft modules) */
     private fun richardsonLucyApprox(
         src: FloatArray, w: Int, h: Int, iterations: Int
     ): FloatArray {
         val psfRadius = 2
         val psf = gaussianKernel(psfRadius, 1.1f)
         val k = psfRadius * 2 + 1
-        var est = src.copyOf()
-        // prevent zeros
+        val est = src.copyOf()
         for (i in est.indices) if (est[i] < 1f) est[i] = 1f
 
         val conv = FloatArray(w * h)
@@ -139,7 +125,7 @@ object SoftDataMatrixReader {
                 val c = if (conv[i] < 1e-3f) 1e-3f else conv[i]
                 relative[i] = src[i] / c
             }
-            convolve(relative, w, h, psf, k, corr) // PSF is symmetric
+            convolve(relative, w, h, psf, k, corr)
             for (i in est.indices) {
                 est[i] = (est[i] * corr[i]).coerceIn(0f, 255f)
             }
@@ -184,7 +170,6 @@ object SoftDataMatrixReader {
 
     private fun unsharp(src: FloatArray, w: Int, h: Int, radius: Int, amount: Float): FloatArray {
         val blur = FloatArray(w * h)
-        // box blur approx
         val tmp = FloatArray(w * h)
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -216,7 +201,6 @@ object SoftDataMatrixReader {
     }
 
     private fun clahe(src: FloatArray, w: Int, h: Int): FloatArray {
-        // lightweight local stretch
         val out = FloatArray(w * h)
         val tile = 8
         val tw = max(8, w / tile)
@@ -245,10 +229,8 @@ object SoftDataMatrixReader {
         return out
     }
 
-    /** Soft sample: average neighborhood at each module center */
     private fun softSample(roi: FloatArray, rw: Int, rh: Int, n: Int, phase: Float): FloatArray {
         val grid = FloatArray(n * n)
-        // normalize roi
         var minV = Float.MAX_VALUE
         var maxV = -Float.MAX_VALUE
         for (v in roi) {
@@ -277,11 +259,6 @@ object SoftDataMatrixReader {
         return grid
     }
 
-    /**
-     * Score Data Matrix structure:
-     * - L solid borders (two adjacent sides mostly dark)
-     * - Timing patterns alternate on the other two sides
-     */
     private fun scoreDataMatrixGrid(grid: FloatArray, n: Int): Double {
         fun row(y: Int) = FloatArray(n) { grid[y * n + it] }
         fun col(x: Int) = FloatArray(n) { grid[it * n + x] }
@@ -309,11 +286,7 @@ object SoftDataMatrixReader {
             top to left
         )
         val bestSolid = solidPairs.maxOf { (a, b) -> a + b }
-
-        // Timing should be on the non-solid sides — use average alternation of all borders
-        val timing = (altScore(row(0)) + altScore(row(n - 1)) +
-            altScore(col(0)) + altScore(col(n - 1))) / 4.0
-
+        val timing = (altScore(row(0)) + altScore(row(n - 1)) + altScore(col(0)) + altScore(col(n - 1))) / 4.0
         return bestSolid + timing
     }
 
